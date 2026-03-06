@@ -1,3 +1,5 @@
 .env
-runs
-checkpoints
+runs/
+checkpoints/
+logs/
+wandb/
