@@ -1,0 +1,95 @@
+08:47:43  ============================================================
+08:47:43  Phase 1 — UNet Segmentation
+08:47:43  W&B run  : None
+08:47:43  Device   : cuda:2  |  AMP: True
+08:47:43  ============================================================
+08:47:43  Train: 240 cases | Val: 60 cases
+08:47:45  Model compiled with torch.compile()
+08:47:45  Trainable params: 12,944,676
+08:47:45  
+============================================================
+Epoch 1/100  LR: 1.00e-04
+08:50:08  Note: detected 192 virtual cores but NumExpr set to maximum of 64, check "NUMEXPR_MAX_THREADS" environment variable.
+08:50:08  Note: NumExpr detected 192 cores but "NUMEXPR_MAX_THREADS" not set, so enforcing safe limit of 16.
+08:50:08  NumExpr defaulting to 16 threads.
+08:54:14    Train → Loss: 0.8358  CE: 0.9769  DiceLoss: 0.8202  Kidney: 0.1237  Tumour: 0.0222  Cyst: 0.0000  Mean: 0.0486
+08:54:14    Train Debug → max_bg_prob: 0.8956  |  max_fg_prob: 1.0000
+08:54:14    Train Debug → soft_dice_per_class: c0: 0.5448  c1: 0.1201  c2: 0.0122  c3: 0.0003
+08:54:14    Train Debug → avg intersect  : c0: 386102.16  c1: 12713.80  c2: 1652.77  c3: 32.62
+08:54:14    Train Debug → avg cardinality: c0: 1415073.57  c1: 208248.11  c2: 239296.27  c3: 234534.04
+08:54:14    Val   → Kidney: 0.0794  Tumour: 0.0064  Cyst: 0.0000  Mean: 0.0286
+08:54:15    ✓ Best model saved (val_mean_dice=0.0286)
+08:54:15  
+============================================================
+Epoch 2/100  LR: 1.00e-04
+08:57:42    Train → Loss: 0.8150  CE: 0.8278  DiceLoss: 0.8135  Kidney: 0.1649  Tumour: 0.0287  Cyst: 0.0000  Mean: 0.0645
+08:57:42    Train Debug → max_bg_prob: 0.8773  |  max_fg_prob: 1.0000
+08:57:42    Train Debug → soft_dice_per_class: c0: 0.6088  c1: 0.1813  c2: 0.0147  c3: 0.0004
+08:57:42    Train Debug → avg intersect  : c0: 449522.90  c1: 15194.43  c2: 1961.09  c3: 45.81
+08:57:42    Train Debug → avg cardinality: c0: 1476563.75  c1: 160983.95  c2: 236232.09  c3: 223372.21
+08:57:42    Val   → Kidney: 0.0724  Tumour: 0.0130  Cyst: 0.0000  Mean: 0.0285
+08:57:43    No improvement 1/35 (best=0.0286)
+08:57:43  
+============================================================
+Epoch 3/100  LR: 9.99e-05
+09:01:07    Train → Loss: 0.7909  CE: 0.7595  DiceLoss: 0.7944  Kidney: 0.1739  Tumour: 0.0312  Cyst: 0.0000  Mean: 0.0684
+09:01:07    Train Debug → max_bg_prob: 0.8675  |  max_fg_prob: 1.0000
+09:01:07    Train Debug → soft_dice_per_class: c0: 0.6374  c1: 0.2039  c2: 0.0158  c3: 0.0002
+09:01:07    Train Debug → avg intersect  : c0: 480827.76  c1: 14977.38  c2: 2110.03  c3: 24.27
+09:01:07    Train Debug → avg cardinality: c0: 1508783.51  c1: 139442.71  c2: 234373.60  c3: 214552.18
+09:01:07    Val   → Kidney: 0.1063  Tumour: 0.0174  Cyst: 0.0000  Mean: 0.0413
+09:01:10    ✓ Best model saved (val_mean_dice=0.0413)
+09:01:10  
+============================================================
+Epoch 4/100  LR: 9.98e-05
+09:04:36    Train → Loss: 0.7777  CE: 0.7377  DiceLoss: 0.7822  Kidney: 0.2052  Tumour: 0.0389  Cyst: 0.0000  Mean: 0.0814
+09:04:36    Train Debug → max_bg_prob: 0.8755  |  max_fg_prob: 1.0000
+09:04:36    Train Debug → soft_dice_per_class: c0: 0.6656  c1: 0.2201  c2: 0.0183  c3: 0.0002
+09:04:36    Train Debug → avg intersect  : c0: 512677.43  c1: 14589.55  c2: 2341.85  c3: 20.75
+09:04:36    Train Debug → avg cardinality: c0: 1540508.09  c1: 124347.94  c2: 226109.22  c3: 206186.74
+09:04:36    Val   → Kidney: 0.1422  Tumour: 0.0179  Cyst: 0.0000  Mean: 0.0534
+09:04:39    ✓ Best model saved (val_mean_dice=0.0534)
+09:04:39  
+============================================================
+Epoch 5/100  LR: 9.96e-05
+09:08:11    Train → Loss: 0.7677  CE: 0.6769  DiceLoss: 0.7778  Kidney: 0.2491  Tumour: 0.0565  Cyst: 0.0000  Mean: 0.1019
+09:08:11    Train Debug → max_bg_prob: 0.8767  |  max_fg_prob: 1.0000
+09:08:11    Train Debug → soft_dice_per_class: c0: 0.6915  c1: 0.2456  c2: 0.0252  c3: 0.0002
+09:08:11    Train Debug → avg intersect  : c0: 542600.23  c1: 14968.65  c2: 3115.93  c3: 20.80
+09:08:11    Train Debug → avg cardinality: c0: 1569365.82  c1: 113614.96  c2: 215925.45  c3: 198245.77
+09:08:11    Val   → Kidney: 0.1208  Tumour: 0.0186  Cyst: 0.0000  Mean: 0.0464
+09:08:12    No improvement 1/35 (best=0.0534)
+09:08:12  
+============================================================
+Epoch 6/100  LR: 9.94e-05
+09:11:38    Train → Loss: 0.7414  CE: 0.6413  DiceLoss: 0.7525  Kidney: 0.2742  Tumour: 0.0646  Cyst: 0.0168  Mean: 0.1185
+09:11:38    Train Debug → max_bg_prob: 0.8973  |  max_fg_prob: 1.0000
+09:11:38    Train Debug → soft_dice_per_class: c0: 0.7143  c1: 0.2818  c2: 0.0279  c3: 0.0003
+09:11:38    Train Debug → avg intersect  : c0: 570309.93  c1: 15173.62  c2: 3334.82  c3: 29.55
+09:11:38    Train Debug → avg cardinality: c0: 1596899.50  c1: 100422.06  c2: 206911.12  c3: 192919.32
+09:11:38    Val   → Kidney: 0.1085  Tumour: 0.0179  Cyst: 0.0000  Mean: 0.0421
+09:11:39    No improvement 2/35 (best=0.0534)
+09:11:39  
+============================================================
+Epoch 7/100  LR: 9.91e-05
+09:15:07    Train → Loss: 0.7167  CE: 0.6226  DiceLoss: 0.7272  Kidney: 0.2803  Tumour: 0.0584  Cyst: 0.0004  Mean: 0.1130
+09:15:07    Train Debug → max_bg_prob: 0.9074  |  max_fg_prob: 1.0000
+09:15:07    Train Debug → soft_dice_per_class: c0: 0.7348  c1: 0.3010  c2: 0.0264  c3: 0.0003
+09:15:07    Train Debug → avg intersect  : c0: 596595.00  c1: 14802.78  c2: 3069.58  c3: 27.30
+09:15:07    Train Debug → avg cardinality: c0: 1623906.51  c1: 90596.20  c2: 196797.55  c3: 185851.75
+09:15:07    Val   → Kidney: 0.1713  Tumour: 0.0286  Cyst: 0.0002  Mean: 0.0667
+09:15:10    ✓ Best model saved (val_mean_dice=0.0667)
+09:15:10  
+============================================================
+Epoch 8/100  LR: 9.88e-05
+09:18:36    Train → Loss: 0.7083  CE: 0.5851  DiceLoss: 0.7219  Kidney: 0.3087  Tumour: 0.0581  Cyst: 0.0001  Mean: 0.1223
+09:18:36    Train Debug → max_bg_prob: 0.9242  |  max_fg_prob: 1.0000
+09:18:36    Train Debug → soft_dice_per_class: c0: 0.7515  c1: 0.3444  c2: 0.0240  c3: 0.0003
+09:18:36    Train Debug → avg intersect  : c0: 618268.68  c1: 15314.54  c2: 2574.97  c3: 28.84
+09:18:36    Train Debug → avg cardinality: c0: 1645476.12  c1: 81172.20  c2: 187971.26  c3: 182532.42
+09:18:36    Val   → Kidney: 0.1882  Tumour: 0.0286  Cyst: 0.0334  Mean: 0.0834
+09:18:38    ✓ Best model saved (val_mean_dice=0.0834)
+09:18:38  
+============================================================
+Epoch 9/100  LR: 9.84e-05
+09:20:12  socket.send() raised exception.
