@@ -1,39 +1,34 @@
 """
-train_survival.py — Phase 2: EGMDM survival analysis
+train_survival_rgb.py — RGB-OmniRad survival analysis
 ======================================================
 Run single experiment:
-    python -m kits21.train_survival
+    python train_survival_rgb.py
 
-Run via launcher (multiple seeds / hyperparams):
-    python -m kits21.run_experiments
+Pipeline
+--------
+  KitsDatasetRGB  →  (D, 3, H, W) 3-channel HU-windowed CT  (no mask, no UNet)
+        ↓
+  OmniRad.encode_volume_rgb()  [frozen]    →  (D, embed_dim)
+        ↓
+  GatedAttentionPooling  [trainable]       →  (embed_dim,)
+    or unweighted mean
+        ↓
+  EGMDMHead              [trainable]       →  survival distribution
 
-All hyperparameters live in kits21/configs/survival_config.py.
-Each run writes exclusively to its own run_dir:
-    runs/<experiment_name>/seed_<seed>/
+Key differences from train_survival.py
+---------------------------------------
+  - No UNet, no segmentation mask, no sliding-window inference.
+  - OmniRad receives 3-channel HU-windowed CT via encode_volume_rgb().
+  - Dataset is KitsDatasetRGB — returns full volumes in both train and val,
+    no tumour-centred cropping (gated attention handles variable depth).
+  - Config is SurvivalRGBConfig.
 
-Mask source (cfg.use_gt_mask)
-------------------------------
-  False (default) — frozen UNet predicts the mask via sliding-window inference.
-                    This is the realistic deployment setting.
-  True            — ground-truth segmentation mask is taken directly from the
-                    dataset.  Use this as an upper-bound experiment to measure
-                    EGMDM performance free of UNet prediction error.
-
-Slice pooling (cfg.slice_pooling)
-----------------------------------
-  "mean"      — unweighted mean over slice embeddings (no extra parameters).
-  "attention" — gated attention pooling (Ilse et al. 2018); trains a small
-                attention network jointly with the EGMDM head.  The attention
-                weights are logged to W&B for interpretability.
-
-Early stopping
---------------
-Tracks val C-index (higher = better).  Best checkpoint is saved whenever
-C-index improves.
+Early stopping: val C-index (higher = better).
 """
 
 import csv
 import os
+os.environ["WANDB_MODE"] = "offline"
 
 import torch
 import torch.optim as optim
@@ -44,88 +39,58 @@ from tqdm import tqdm
 
 load_dotenv()
 
-from configs.survival_config import SurvivalConfig
-from data.dataset            import KitsDataset
-from losses.survival_loss    import EGMDMLoss
-from models.egmdm            import EGMDMHead
-from models.omnirad          import GatedAttentionPooling, OmniRadEncoder
-from models.unet             import SimpleUNet3D
-from utils.inference         import sliding_window_predict
-from utils.logging_utils     import log_config, setup_logging
-from utils.metrics           import concordance_index
-from utils.seed              import set_seed
+from configs.survival_rgb_config import SurvivalRGBConfig
+from data.dataset                import KitsDatasetRGB
+from losses.survival_loss        import EGMDMLoss
+from models.egmdm                import EGMDMHead
+from models.omnirad              import GatedAttentionPooling, OmniRadEncoder
+from utils.logging_utils         import log_config, setup_logging
+from utils.metrics               import concordance_index
+from utils.seed                  import set_seed
 
 
 # ─── Patient embedding pipeline ───────────────────────────────────────────────
 
 @torch.no_grad()
-def embed_patient(
-    ct:       torch.Tensor,                       # (D, H, W) float32 on CPU
-    unet:     torch.nn.Module,
-    omnirad:  OmniRadEncoder,
-    pooling:  torch.nn.Module,                    # GatedAttentionPooling or identity
-    cfg:      SurvivalConfig,
-    device:   torch.device,
-    gt_mask:  torch.Tensor | None = None,         # (D, H, W) int64 on CPU
+def embed_patient_rgb(
+    ct_rgb:  torch.Tensor,                        # (D, 3, H, W) float32 on CPU
+    omnirad: OmniRadEncoder,
+    pooling: torch.nn.Module | None,
+    cfg:     SurvivalRGBConfig,
+    device:  torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
-    Build a patient-level embedding vector from a CT volume.
+    Build a patient-level embedding from a 3-channel HU-windowed CT volume.
 
     Pipeline
     --------
-    1. Obtain segmentation mask:
-         - cfg.use_gt_mask=True  → use gt_mask directly (must be provided)
-         - cfg.use_gt_mask=False → run frozen UNet in sliding-window mode
-    2. OmniRad encodes every (CT slice, mask slice) pair → (D, embed_dim) on CPU.
-    3. Pool across depth with the chosen pooling module:
-         - "mean"      → unweighted mean → (embed_dim,) on CPU
-         - "attention" → gated attention → (embed_dim,) on CPU
-                         also returns (D,) attention weights for logging
+    1. OmniRad encodes every slice via encode_volume_rgb() → (D, embed_dim) on CPU.
+    2. Pool across depth:
+         "mean"      → unweighted mean → (embed_dim,) on CPU
+         "attention" → gated attention → (embed_dim,) on CPU
+                       also returns (D,) attention weights for logging.
 
     Parameters
     ----------
-    ct      : (D, H, W) CT volume normalised to [0, 1], on CPU
-    unet    : frozen SimpleUNet3D — only used when cfg.use_gt_mask is False
+    ct_rgb  : (D, 3, H, W) float32, channels already in [0, 1], on CPU
     omnirad : frozen OmniRadEncoder
-    pooling : GatedAttentionPooling (trainable) when cfg.slice_pooling="attention",
-              or torch.nn.Identity (passthrough) when cfg.slice_pooling="mean"
-    cfg     : SurvivalConfig — controls use_gt_mask, slice_pooling, etc.
-    device  : GPU/CPU device for UNet inference and attention
-    gt_mask : (D, H, W) int64 ground-truth mask from the dataset batch;
-              required when cfg.use_gt_mask is True, ignored otherwise
+    pooling : GatedAttentionPooling (trainable) or None (mean pooling)
+    cfg     : SurvivalRGBConfig
+    device  : GPU device for attention forward pass
 
     Returns
     -------
-    embedding      : (embed_dim,) tensor on CPU
-    attn_weights   : (D,) tensor on CPU if slice_pooling="attention", else None
+    embedding    : (embed_dim,) on CPU
+    attn_weights : (D,) on CPU if slice_pooling="attention", else None
     """
-    # ── Step 1: mask ──────────────────────────────────────────────────────
-    if cfg.use_gt_mask:
-        if gt_mask is None:
-            raise ValueError("cfg.use_gt_mask is True but gt_mask was not provided.")
-        mask = gt_mask   # (D, H, W) int64 on CPU
-    else:
-        mask = sliding_window_predict(
-            model       = unet,
-            volume      = ct,
-            num_classes = cfg.num_classes,
-            window      = cfg.sw_window,
-            stride      = cfg.sw_stride,
-            device      = device,
-        )   # (D, H, W) int64 on CPU
-
-    # ── Step 2: per-slice OmniRad embeddings ──────────────────────────────
-    slice_embs = omnirad.encode_volume(
-        ct          = ct,
-        mask        = mask,
-        num_classes = cfg.num_classes,
-        batch_size  = cfg.omni_batch,
+    # Per-slice embeddings — no mask assembly, RGB channels go in directly
+    slice_embs = omnirad.encode_volume_rgb(
+        ct_rgb     = ct_rgb,
+        batch_size = cfg.omni_batch,
     )   # (D, embed_dim) on CPU
 
-    # ── Step 3: pool across depth ─────────────────────────────────────────
     if cfg.slice_pooling == "attention":
-        # Attention is trainable — run with grad enabled even though this
-        # function is decorated @no_grad; we re-enable it explicitly here.
+        # Attention is trainable — re-enable grad inside the no_grad scope
         with torch.enable_grad():
             emb, attn_weights = pooling(slice_embs.to(device))
         return emb.cpu(), attn_weights.detach().cpu()
@@ -135,20 +100,20 @@ def embed_patient(
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
-def train_survival(cfg: SurvivalConfig | None = None) -> str:
+def train_survival_rgb(cfg: SurvivalRGBConfig | None = None) -> str:
     """
-    Train one survival experiment defined by `cfg`.
+    Train one RGB-OmniRad survival experiment defined by `cfg`.
 
     Returns
     -------
     best_ckpt_path : str
     """
-    cfg    = cfg or SurvivalConfig()
+    cfg    = cfg or SurvivalRGBConfig()
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
 
     set_seed(cfg.seed)
 
-    logger, csv_path = setup_logging(cfg.log_dir, prefix="survival")
+    logger, csv_path = setup_logging(cfg.log_dir, prefix="survival_rgb")
 
     # ── W&B ────────────────────────────────────────────────────────────────
     wandb.login(key=os.environ["WANDB_API_KEY"])
@@ -161,9 +126,9 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
     )
 
     logger.info("=" * 60)
-    logger.info(f"Phase 2 — EGMDM Survival Analysis")
-    logger.info(f"W&B run     : {run.url}")
-    logger.info(f"Device      : {device}")
+    logger.info(f"RGB-OmniRad Survival Analysis")
+    logger.info(f"W&B run  : {run.url}")
+    logger.info(f"Device   : {device}")
     logger.info("=" * 60)
     log_config(logger, cfg)
 
@@ -175,8 +140,10 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
         split_file     = cfg.json_path,
         metadata_path  = os.path.join(cfg.root_dir, "kits.json"),
     )
-    train_ds = KitsDataset(**_ds_kwargs, mode="train")
-    val_ds   = KitsDataset(**_ds_kwargs, mode="val")
+    # KitsDatasetRGB always returns full volumes (no cropping) — mode only
+    # controls which case IDs are loaded (train split vs val split).
+    train_ds = KitsDatasetRGB(**_ds_kwargs, mode="train")
+    val_ds   = KitsDatasetRGB(**_ds_kwargs, mode="val")
 
     _dl_kwargs = dict(
         batch_size         = 1,
@@ -189,31 +156,11 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
     val_loader   = DataLoader(val_ds,   shuffle=False, **_dl_kwargs)
 
     logger.info(f"Train: {len(train_ds)} cases | Val: {len(val_ds)} cases")
-
-    # ── Frozen UNet ────────────────────────────────────────────────────────
-    if not os.path.exists(cfg.unet_ckpt):
-        raise FileNotFoundError(
-            f"UNet checkpoint not found: '{cfg.unet_ckpt}'\n"
-            "Run Phase 1 (train_unet) first, or set cfg.unet_ckpt correctly."
-        )
-    unet = SimpleUNet3D(
-        n_classes     = cfg.num_classes,
-        base_channels = cfg.unet_base_channels,
-        trilinear     = cfg.unet_trilinear,
-    ).to(device)
-    unet_ckpt = torch.load(cfg.unet_ckpt, map_location=device)
-    # Strip the "_orig_mod." prefix that torch.compile() adds to state_dict keys
-    # so the checkpoint loads cleanly into a plain (uncompiled) SimpleUNet3D.
-    unet.load_state_dict({
-        k.removeprefix("_orig_mod."): v
-        for k, v in unet_ckpt["model_state"].items()
-    })
-    unet.eval()
-    for p in unet.parameters():
-        p.requires_grad_(False)
     logger.info(
-        f"Frozen UNet loaded  "
-        f"(val_mean_dice={unet_ckpt.get('val_mean_dice', float('nan')):.4f})"
+        f"HU windows — "
+        f"R: {KitsDatasetRGB.HU_WINDOWS[0]}  "
+        f"G: {KitsDatasetRGB.HU_WINDOWS[1]}  "
+        f"B: {KitsDatasetRGB.HU_WINDOWS[2]}"
     )
 
     # ── Frozen OmniRad ─────────────────────────────────────────────────────
@@ -252,7 +199,7 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
     wandb.log({"model/egmdm_params": n_egmdm}, step=0)
 
     # ── Loss / optimiser / scheduler ───────────────────────────────────────
-    # Optimise pooling + EGMDM jointly; OmniRad and UNet are frozen.
+    # Only pooling + EGMDM are trained; OmniRad is fully frozen.
     trainable_params = list(egmdm.parameters())
     if pooling is not None:
         trainable_params += list(pooling.parameters())
@@ -299,21 +246,18 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
 
         pbar = tqdm(train_loader, desc=f"  Train [{epoch}]", leave=False)
         for batch in pbar:
-            ct      = batch["ct"][0]      # (D, H, W) CPU
-            gt_mask = batch["mask"][0]    # (D, H, W) CPU int64
+            ct_rgb  = batch["ct_rgb"][0]          # (D, 3, H, W) CPU
             event   = batch["event"][0]
             t_day   = batch["survival_time"][0]
 
-            emb, _ = embed_patient(
-                ct      = ct,
-                unet    = unet,
+            emb, _ = embed_patient_rgb(
+                ct_rgb  = ct_rgb,
                 omnirad = omnirad,
                 pooling = pooling,
                 cfg     = cfg,
                 device  = device,
-                gt_mask = gt_mask,
             )
-            emb = emb.unsqueeze(0).to(device)   # (1, embed_dim)
+            emb = emb.unsqueeze(0).to(device)     # (1, embed_dim)
 
             params, reg = egmdm(emb)
             t = (t_day / 365.25).unsqueeze(0).to(device)
@@ -338,24 +282,20 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
             pooling.eval()
         vl_loss = vl_nll = 0.0
         all_risks, all_times, all_events = [], [], []
-        # Collect attention weights from the last val epoch for W&B logging
         all_attn: list[torch.Tensor] = []
 
         with torch.no_grad():
             for batch in tqdm(val_loader, desc=f"  Val   [{epoch}]", leave=False):
-                ct      = batch["ct"][0]
-                gt_mask = batch["mask"][0]
+                ct_rgb  = batch["ct_rgb"][0]
                 event   = batch["event"][0]
                 t_day   = batch["survival_time"][0]
 
-                emb, attn_w = embed_patient(
-                    ct      = ct,
-                    unet    = unet,
+                emb, attn_w = embed_patient_rgb(
+                    ct_rgb  = ct_rgb,
                     omnirad = omnirad,
                     pooling = pooling,
                     cfg     = cfg,
                     device  = device,
-                    gt_mask = gt_mask,
                 )
                 emb = emb.unsqueeze(0).to(device)
 
@@ -367,6 +307,7 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
                 vl_loss += loss.item()
                 vl_nll  += nll.item()
 
+                # Risk = P(event by 1 year)
                 risk = egmdm.cdf(params, torch.tensor([1.0], device=device)).squeeze().cpu()
                 all_risks.append(risk)
                 all_times.append(t_day.cpu())
@@ -400,10 +341,7 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
             "val/cindex":      c_index,
             "val/best_cindex": max(best_cindex, c_index),
         }
-        # Log mean attention weight entropy as a measure of how focused
-        # the model's attention is across slices.  Each patient has a
-        # different D so we compute entropy per-patient then average —
-        # torch.stack would fail because the tensors have unequal lengths.
+        # Attention entropy — per-patient then averaged (variable D per patient)
         if all_attn:
             entropy = torch.tensor([
                 -(w * (w + 1e-8).log()).sum().item()
@@ -461,7 +399,7 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
             wandb.run.summary["early_stop_epoch"] = epoch
             break
 
-    logger.info(f"\nPhase 2 complete. Best val C-index: {best_cindex:.4f}")
+    logger.info(f"\nRGB experiment complete. Best val C-index: {best_cindex:.4f}")
     logger.info(f"Best checkpoint: {cfg.best_ckpt}")
     wandb.finish()
 
@@ -469,4 +407,4 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
 
 
 if __name__ == "__main__":
-    train_survival()
+    train_survival_rgb()

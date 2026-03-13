@@ -58,9 +58,31 @@ class SurvivalConfig:
     sw_window: int = 16
     sw_stride: int = 8
 
+    # ── Device ────────────────────────────────────────────────────────────-
+    # Override this to pin a run to a specific GPU (e.g. 'cuda:1').
+    device: str = "cuda:2"
+
+    # ── Mask source ────────────────────────────────────────────────────────
+    # True  → use the ground-truth segmentation mask from the dataset.
+    #         Useful for upper-bound experiments: removes UNet error from the
+    #         survival pipeline so you can isolate EGMDM performance.
+    # False → run the frozen UNet in sliding-window mode to predict the mask.
+    #         This is the realistic inference-time setting.
+    use_gt_mask: bool = True
+
     # ── OmniRad (frozen) ───────────────────────────────────────────────────
     embed_dim:  int = 768   # OmniRad-base ViT output dimension
     omni_batch: int = 16    # slices per OmniRad forward pass — tune to VRAM
+
+    # ── Slice pooling ──────────────────────────────────────────────────────
+    # How per-slice OmniRad embeddings are aggregated into a single patient
+    # vector before the EGMDM head.
+    #   "mean"      — unweighted mean across depth (no extra parameters)
+    #   "attention" — gated attention pooling (Ilse et al. 2018); trains a
+    #                 small attention network on top of frozen OmniRad
+    slice_pooling:          str = "mean"   # "mean" | "attention"
+    attn_hidden_size:       int = 128      # inner dim of the attention network
+    attn_dropout:           float = 0.25  # dropout inside the attention gate
 
     # ── EGMDM Head ─────────────────────────────────────────────────────────
     egmdm_E:           int   = 3
@@ -96,9 +118,15 @@ class SurvivalConfig:
         os.makedirs(self.run_dir, exist_ok=True)
 
     def to_dict(self) -> dict:
-        """Flat dict suitable for wandb.init(config=...)."""
+        """
+        Flat dict of every config value, suitable for wandb.init(config=...).
+
+        Derived path fields are included so W&B / logs record exactly where
+        this run's outputs landed.  Tuple fields are converted to strings so
+        they display cleanly in the W&B config panel.
+        """
         import dataclasses
-        return {
-            k: v for k, v in dataclasses.asdict(self).items()
-            if k not in ("run_dir", "best_ckpt", "last_ckpt", "log_dir")
-        }
+        d = dataclasses.asdict(self)
+        d["target_spacing"] = str(d["target_spacing"])
+        d["target_shape"]   = str(d["target_shape"])
+        return d

@@ -189,3 +189,119 @@ class KitsDataset(Dataset):
         event         = meta["vital_status"] == "dead"
         survival_time = meta.get("vital_days_after_surgery") or 0.0
         return bool(event), float(survival_time)
+
+RGB_HU_WINDOWS = [
+    (-150.0, 250.0),   # R — soft tissue / renal parenchyma
+    ( -50.0, 300.0),   # G — tumour / vascular enhancement
+    (   0.0, 400.0),   # B — denser structures / late-phase enhancement
+]
+ 
+ 
+class KitsDatasetRGB(KitsDataset):
+    """
+    3-channel HU-windowed CT dataset for the RGB-OmniRad survival experiment.
+ 
+    Design
+    ------
+    - Always returns the **full volume** regardless of mode — no tumour-centred
+      or random depth cropping.  The full slice sequence is passed to OmniRad
+      once to extract features; gated attention pooling handles variable depth.
+    - The segmentation mask is **never loaded** — no cropping means it is not
+      needed at all, saving I/O time.
+    - Each CT is converted to 3 channels by applying three independent HU
+      windows and rescaling each to [0, 1].
+ 
+    HU windows (R, G, B)
+    --------------------
+      R : [-150, 250]  — soft tissue / renal parenchyma
+      G : [ -50, 300]  — tumour blush / vascular enhancement
+      B : [   0, 400]  — denser structures / late-phase enhancement
+ 
+    Return schema
+    -------------
+    {"ct_rgb": (D, 3, H, W) float32, "caseid", "event", "survival_time"}
+    """
+ 
+    HU_WINDOWS = RGB_HU_WINDOWS   # override at class level if needed
+ 
+    # ── Full item pipeline ────────────────────────────────────────────────
+ 
+    def __getitem__(self, index: int) -> dict:
+        caseid = self.cases[index]
+ 
+        # Load and orient image only — mask is not needed (no cropping)
+        image = sitk.ReadImage(os.path.join(self.rootdir, caseid, "imaging.nii.gz"))
+        image = sitk.DICOMOrient(image, "RAS")
+        image = self._resample_image_only(image)
+ 
+        ct_rgb = self._to_rgb_tensor(image)           # (D, 3, H, W)
+        ct_rgb = self._spatial_resize_rgb(ct_rgb)     # (D, 3, target_H, target_W)
+ 
+        event, survival_time = self._get_survival(caseid)
+ 
+        return {
+            "ct_rgb":        ct_rgb,
+            "caseid":        caseid,
+            "event":         torch.tensor(event,         dtype=torch.bool),
+            "survival_time": torch.tensor(survival_time, dtype=torch.float32),
+        }
+ 
+    # ── Resample image only (no mask) ─────────────────────────────────────
+ 
+    def _resample_image_only(self, image: sitk.Image) -> sitk.Image:
+        original_size    = image.GetSize()
+        original_spacing = image.GetSpacing()
+        new_size = [
+            int(round(osz * osp / tsp))
+            for osz, osp, tsp in zip(original_size, original_spacing, self.target_spacing)
+        ]
+        r = sitk.ResampleImageFilter()
+        r.SetSize(new_size)
+        r.SetOutputSpacing(self.target_spacing)
+        r.SetOutputOrigin(image.GetOrigin())
+        r.SetOutputDirection(image.GetDirection())
+        r.SetInterpolator(sitk.sitkLinear)
+        r.SetDefaultPixelValue(-1000)
+        return r.Execute(image)
+ 
+    # ── 3-channel HU windowing ────────────────────────────────────────────
+ 
+    def _to_rgb_tensor(self, image: sitk.Image) -> torch.Tensor:
+        """
+        Convert raw HU values to a (D, 3, H, W) float32 tensor.
+ 
+        Each channel is independently clipped to its HU window and rescaled
+        to [0, 1].  No global clipping is applied before windowing.
+        """
+        hu = sitk.GetArrayFromImage(image).astype(np.float32)  # (D, H, W)
+ 
+        channels = []
+        for hu_min, hu_max in self.HU_WINDOWS:
+            ch = np.clip(hu, hu_min, hu_max)
+            ch = (ch - hu_min) / (hu_max - hu_min)
+            channels.append(ch)
+ 
+        return torch.from_numpy(np.stack(channels, axis=1))  # (D, 3, H, W)
+ 
+    # ── Spatial resize ────────────────────────────────────────────────────
+ 
+    def _spatial_resize_rgb(self, ct_rgb: torch.Tensor) -> torch.Tensor:
+        """Resize (D, 3, H, W) → (D, 3, target_H, target_W). D treated as batch."""
+        return TF.resize(
+            ct_rgb,
+            list(self.target_shape),
+            interpolation = InterpolationMode.BILINEAR,
+            antialias     = True,
+        )
+ 
+    # ── Disable parent methods that don't apply here ─────────────────────
+ 
+    def _to_tensors(self, image, mask):
+        raise NotImplementedError("KitsDatasetRGB uses _to_rgb_tensor instead.")
+ 
+    def _spatial_resize(self, image, mask):
+        raise NotImplementedError("KitsDatasetRGB uses _spatial_resize_rgb instead.")
+ 
+    def _train_crop(self, image, mask):
+        raise NotImplementedError("KitsDatasetRGB never crops — full volume always returned.")
+   

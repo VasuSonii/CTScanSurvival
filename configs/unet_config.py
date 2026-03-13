@@ -80,9 +80,17 @@ class UNetConfig:
         os.makedirs(self.run_dir, exist_ok=True)
 
     def to_dict(self) -> dict:
-        """Flat dict suitable for wandb.init(config=...)."""
+        """
+        Flat dict of every config value, suitable for wandb.init(config=...).
+
+        Derived path fields are included so W&B / logs record exactly where
+        this run's outputs landed.  List fields are converted to strings so
+        they display cleanly in the W&B config panel.
+        """
         import dataclasses
-        return {
-            k: v for k, v in dataclasses.asdict(self).items()
-            if k not in ("run_dir", "best_ckpt", "last_ckpt", "log_dir")
-        }
+        d = dataclasses.asdict(self)
+        # Convert lists to strings for clean W&B display
+        d["class_weights"] = str(d["class_weights"])
+        d["target_spacing"] = str(d["target_spacing"])
+        d["target_shape"]   = str(d["target_shape"])
+        return d

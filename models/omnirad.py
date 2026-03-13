@@ -64,9 +64,12 @@ class OmniRadEncoder(nn.Module):
             transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
         ])
 
-        # Register normalisation buffers so they move with .to(device)
-        mean = torch.tensor(_IMAGENET_MEAN).view(3, 1, 1)
-        std  = torch.tensor(_IMAGENET_STD).view(3, 1, 1)
+        # Create buffers directly on self.device.
+        # register_buffer() alone is not enough here because OmniRadEncoder
+        # itself is never moved with .to(device) — only self.model is — so
+        # buffers created on CPU would stay on CPU while slices are on GPU.
+        mean = torch.tensor(_IMAGENET_MEAN, device=self.device).view(3, 1, 1)
+        std  = torch.tensor(_IMAGENET_STD,  device=self.device).view(3, 1, 1)
         self.register_buffer("_mean", mean)
         self.register_buffer("_std",  std)
 
@@ -138,3 +141,92 @@ class OmniRadEncoder(nn.Module):
             all_embs.append(self.model(slices).cpu())  # (B, embed_dim)
 
         return torch.cat(all_embs, dim=0)              # (D, embed_dim)
+
+# ─── Slice pooling ────────────────────────────────────────────────────────────
+
+class GatedAttentionPooling(nn.Module):
+    """
+    Gated attention pooling over a variable-length set of slice embeddings.
+
+    Based on: Ilse et al., "Attention-based Deep Multiple Instance Learning"
+    (ICML 2018).  https://arxiv.org/abs/1802.04712
+
+    Given D slice embeddings H = {h_1, ..., h_D} ∈ R^(D × L):
+
+        a_i = softmax_i( w^T (tanh(V h_i) ⊙ sigmoid(U h_i)) )
+        z   = Σ_i a_i h_i                     ∈ R^L
+
+    The gating mechanism (sigmoid branch) lets the network suppress
+    uninformative slices rather than just re-weighting them.
+
+    This module is **trainable** — it should be instantiated and owned by the
+    training script, included in the optimizer, and saved in the checkpoint
+    separately from the frozen OmniRad encoder.
+
+    Parameters
+    ----------
+    embed_dim   : dimensionality of each slice embedding (L)
+    hidden_size : inner dimension of the attention projection (default 128)
+    dropout     : dropout applied to both attention branches (default 0.25)
+
+    Inputs
+    ------
+    h : (D, L) or (B, D, L) — slice embeddings for one patient (or a batch)
+
+    Outputs
+    -------
+    z       : (L,) or (B, L) — pooled patient embedding
+    weights : (D,) or (B, D) — normalised attention weights (for inspection)
+    """
+
+    def __init__(
+        self,
+        embed_dim:   int,
+        hidden_size: int   = 128,
+        dropout:     float = 0.25,
+    ) -> None:
+        super().__init__()
+        self.embed_dim   = embed_dim
+        self.hidden_size = hidden_size
+
+        # Tanh branch  V ∈ R^(H × L)
+        self.tanh_branch = nn.Sequential(
+            nn.Linear(embed_dim, hidden_size, bias=True),
+            nn.Tanh(),
+            nn.Dropout(p=dropout),
+        )
+        # Sigmoid gate  U ∈ R^(H × L)
+        self.gate_branch = nn.Sequential(
+            nn.Linear(embed_dim, hidden_size, bias=True),
+            nn.Sigmoid(),
+            nn.Dropout(p=dropout),
+        )
+        # Attention projection  w ∈ R^(1 × H)
+        self.attention = nn.Linear(hidden_size, 1, bias=False)
+
+    def forward(
+        self, h: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Parameters
+        ----------
+        h : (D, L) for a single patient, or (B, D, L) for a batch
+
+        Returns
+        -------
+        z       : (L,) or (B, L)
+        weights : (D,) or (B, D)  — softmax-normalised attention scores
+        """
+        unbatched = h.dim() == 2
+        if unbatched:
+            h = h.unsqueeze(0)   # → (1, D, L)
+
+        # Gated attention score: (B, D, H) → (B, D, 1)
+        score = self.attention(self.tanh_branch(h) * self.gate_branch(h))
+        weights = torch.softmax(score, dim=1)    # (B, D, 1)
+
+        z = (weights * h).sum(dim=1)             # (B, L)
+
+        if unbatched:
+            return z.squeeze(0), weights.squeeze(0).squeeze(-1)  # (L,), (D,)
+        return z, weights.squeeze(-1)            # (B, L), (B, D)

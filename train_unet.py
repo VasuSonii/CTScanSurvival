@@ -50,7 +50,7 @@ def train_unet(cfg: UNetConfig | None = None) -> str:
                      useful for chaining into Phase 2.
     """
     cfg     = cfg or UNetConfig()
-    device  = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device  = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
     use_amp = device.type == "cuda"
 
     # ── Seed everything ────────────────────────────────────────────────────
