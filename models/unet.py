@@ -66,12 +66,13 @@ class SimpleUNet3D(nn.Module):
         n_classes:     int  = 4,
         base_channels: int  = 32,
         trilinear:     bool = True,
+        in_channels:   int  = 1,    # 1 for KiTS (CT only), 2 for HECKTOR (CT+PT)
     ):
         super().__init__()
         b = base_channels
         f = 2 if trilinear else 1
 
-        self.inc   = _DoubleConv(1,            b)
+        self.inc   = _DoubleConv(in_channels,  b)
         self.down1 = _Down(b,                  b * 2)
         self.down2 = _Down(b * 2,              b * 4)
         self.down3 = _Down(b * 4,              b * 8)
@@ -84,7 +85,7 @@ class SimpleUNet3D(nn.Module):
         self.outc  = nn.Conv3d(b, n_classes, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, 1, D, H, W) — channel dim must be added before calling."""
+        """x: (B, C, D, H, W) — C = in_channels (1 for CT-only, 2 for CT+PT)."""
         x1 = self.inc(x)
         x2 = self.down1(x1)
         x3 = self.down2(x2)

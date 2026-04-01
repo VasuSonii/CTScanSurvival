@@ -142,6 +142,104 @@ class OmniRadEncoder(nn.Module):
 
         return torch.cat(all_embs, dim=0)              # (D, embed_dim)
 
+    @torch.no_grad()
+    def encode_volume_rgb(
+        self,
+        ct_rgb:     torch.Tensor,   # (D, 3, H, W) float32 [0, 1] — pre-built RGB
+        batch_size: int = 16,
+    ) -> torch.Tensor:
+        """
+        Encode a pre-built 3-channel HU-windowed CT volume.
+
+        Unlike encode_volume(), this method receives the 3 channels already
+        assembled (e.g. by KitsRGBDataset) so no CT+mask interleaving is
+        needed.  It only applies spatial resize and ImageNet normalisation
+        before passing slices through the ViT.
+
+        Parameters
+        ----------
+        ct_rgb     : (D, 3, H, W) float32, each channel already in [0, 1]
+        batch_size : slices per forward pass — tune to VRAM
+
+        Returns
+        -------
+        embeddings : (D, embed_dim) on CPU
+        """
+        D        = ct_rgb.shape[0]
+        all_embs = []
+
+        for start in range(0, D, batch_size):
+            end    = min(start + batch_size, D)
+            slices = ct_rgb[start:end].to(self.device)           # (B, 3, H, W)
+
+            slices = F.interpolate(
+                slices, size=(_IMG_SIZE, _IMG_SIZE),
+                mode="bilinear", align_corners=False,
+            )
+            slices = (slices - self._mean.unsqueeze(0)) / self._std.unsqueeze(0)
+
+            all_embs.append(self.model(slices).cpu())            # (B, embed_dim)
+
+        return torch.cat(all_embs, dim=0)                        # (D, embed_dim)
+
+    @torch.no_grad()
+    def encode_volume_ct_pt(
+        self,
+        ct:          torch.Tensor,   # (D, H, W) float32 [0, 1]
+        pt:          torch.Tensor,   # (D, H, W) float32 [0, 1]
+        mask:        torch.Tensor,   # (D, H, W) int64 / float32, values 0-1
+        num_classes: int = 2,        # HECKTOR: background + tumour
+        batch_size:  int = 16,
+    ) -> torch.Tensor:
+        """
+        Encode a CT+PT volume using OmniRad.
+
+        3-channel layout for HECKTOR: [CT, PT, mask_norm]
+        All three channels carry real signal — CT for anatomy, PT for
+        metabolic activity, mask for tumour localisation.
+
+        Compare with KiTS encode_volume which uses [CT, mask_norm, CT]
+        because only CT is available (PT channel duplicates CT).
+
+        Parameters
+        ----------
+        ct         : (D, H, W) CT  normalised to [0, 1]
+        pt         : (D, H, W) PT  normalised to [0, 1]
+        mask       : (D, H, W) segmentation mask — predicted or ground-truth
+        num_classes: number of segmentation classes (for mask normalisation)
+        batch_size : slices per forward pass
+
+        Returns
+        -------
+        embeddings : (D, embed_dim) on CPU
+        """
+        D        = ct.shape[0]
+        all_embs = []
+        mask_norm_scale = max(num_classes - 1, 1)
+
+        for start in range(0, D, batch_size):
+            end   = min(start + batch_size, D)
+
+            # Build (B, 3, H, W): ch0=CT, ch1=PT, ch2=mask_norm
+            batch = torch.stack([
+                torch.stack([
+                    ct[i].float(),
+                    pt[i].float(),
+                    mask[i].float() / mask_norm_scale,
+                ], dim=0)
+                for i in range(start, end)
+            ], dim=0).to(self.device)                            # (B, 3, H, W)
+
+            batch = F.interpolate(
+                batch, size=(_IMG_SIZE, _IMG_SIZE),
+                mode="bilinear", align_corners=False,
+            )
+            batch = (batch - self._mean.unsqueeze(0)) / self._std.unsqueeze(0)
+
+            all_embs.append(self.model(batch).cpu())             # (B, embed_dim)
+
+        return torch.cat(all_embs, dim=0)                        # (D, embed_dim)
+
 # ─── Slice pooling ────────────────────────────────────────────────────────────
 
 class GatedAttentionPooling(nn.Module):

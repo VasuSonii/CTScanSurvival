@@ -28,10 +28,10 @@ load_dotenv()
 
 from configs.unet_config  import UNetConfig
 from data.dataset         import KitsDataset
-from losses.seg_loss      import CEDiceLoss
+from losses.seg_loss      import build_seg_loss
 from models.unet          import SimpleUNet3D
 from utils.inference      import sliding_window_inference
-from utils.logging_utils  import setup_logging
+from utils.logging_utils  import log_config, setup_logging
 from utils.metrics        import compute_kits_dice
 from utils.seed           import set_seed
 from utils.wandb_utils    import (
@@ -50,7 +50,7 @@ def train_unet(cfg: UNetConfig | None = None) -> str:
                      useful for chaining into Phase 2.
     """
     cfg     = cfg or UNetConfig()
-    device  = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    device  = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     use_amp = device.type == "cuda"
 
     # ── Seed everything ────────────────────────────────────────────────────
@@ -70,11 +70,10 @@ def train_unet(cfg: UNetConfig | None = None) -> str:
 
     logger.info("=" * 60)
     logger.info(f"Phase 1 — UNet Segmentation")
-    logger.info(f"Experiment : {cfg.experiment_name}  |  Seed: {cfg.seed}")
-    logger.info(f"Run dir    : {cfg.run_dir}")
     logger.info(f"W&B run    : {run.url}")
     logger.info(f"Device     : {device}  |  AMP: {use_amp}")
     logger.info("=" * 60)
+    log_config(logger, cfg)
 
     # ── Data ───────────────────────────────────────────────────────────────
     _ds_kwargs = dict(
@@ -100,15 +99,21 @@ def train_unet(cfg: UNetConfig | None = None) -> str:
     logger.info(f"Train: {len(train_ds)} cases | Val: {len(val_ds)} cases")
 
     # ── Model ──────────────────────────────────────────────────────────────
-    model = SimpleUNet3D(
+    raw_model = SimpleUNet3D(
         n_classes     = cfg.num_classes,
         base_channels = cfg.base_channels,
         trilinear     = cfg.trilinear,
     ).to(device)
 
+    # Keep a reference to the raw model for checkpointing.
+    # torch.compile() wraps the model and prefixes all state_dict keys with
+    # "_orig_mod.", which breaks loading into a plain SimpleUNet3D in Phase 2.
+    # Saving raw_model.state_dict() avoids this entirely.
     if hasattr(torch, "compile"):
-        model = torch.compile(model)
+        model = torch.compile(raw_model)
         logger.info("Model compiled with torch.compile()")
+    else:
+        model = raw_model
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Trainable params: {n_params:,}")
@@ -116,10 +121,7 @@ def train_unet(cfg: UNetConfig | None = None) -> str:
     wandb.watch(model, log="gradients", log_freq=100)
 
     # ── Loss / optimiser / scheduler ───────────────────────────────────────
-    criterion = CEDiceLoss(
-        ce_weight     = cfg.ce_weight,
-        class_weights = cfg.class_weights,
-    ).to(device)
+    criterion = build_seg_loss(cfg).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.num_epochs, eta_min=1e-6)
     scaler    = GradScaler(device=device.type, enabled=use_amp)
@@ -255,7 +257,7 @@ def train_unet(cfg: UNetConfig | None = None) -> str:
         # ── Checkpoint — written to cfg.run_dir, never overwritten by other runs
         ckpt_payload = {
             "epoch":            epoch,
-            "model_state":      model.state_dict(),
+            "model_state":      raw_model.state_dict(),   # never has _orig_mod. prefix
             "optimizer_state":  optimizer.state_dict(),
             "scheduler_state":  scheduler.state_dict(),
             "scaler_state":     scaler.state_dict(),

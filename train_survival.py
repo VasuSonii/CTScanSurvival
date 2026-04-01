@@ -43,7 +43,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 load_dotenv()
-
+os.environ["WANDB_MODE"] = "offline"
 from configs.survival_config import SurvivalConfig
 from data.dataset            import KitsDataset
 from losses.survival_loss    import EGMDMLoss
@@ -54,6 +54,8 @@ from utils.inference         import sliding_window_predict
 from utils.logging_utils     import log_config, setup_logging
 from utils.metrics           import concordance_index
 from utils.seed              import set_seed
+from data.clinical_preprocessor import ClinicalPreprocessor
+from models.clinical_mlp        import ClinicalMLP
 
 
 # ─── Patient embedding pipeline ───────────────────────────────────────────────
@@ -154,9 +156,11 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
     wandb.login(key=os.environ["WANDB_API_KEY"])
     run = wandb.init(
         project = cfg.wandb_project,
-        name    = f"{cfg.experiment_name}_seed{cfg.seed}",
+        name    = f"{cfg.experiment_name}_{cfg._variant}_seed{cfg.seed}",
         group   = cfg.experiment_name,
         config  = cfg.to_dict(),
+        notes   = cfg.wandb_notes or None,
+        tags    = cfg.wandb_tags  or [],
         reinit  = True,
     )
 
@@ -173,7 +177,7 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
         target_spacing = cfg.target_spacing,
         target_shape   = cfg.target_shape,
         split_file     = cfg.json_path,
-        metadata_path  = os.path.join(cfg.root_dir, "kits.json"),
+        metadata_path  = os.path.join(cfg.root_dir, "kits23.json"),
     )
     train_ds = KitsDataset(**_ds_kwargs, mode="train")
     val_ds   = KitsDataset(**_ds_kwargs, mode="val")
@@ -190,57 +194,88 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
 
     logger.info(f"Train: {len(train_ds)} cases | Val: {len(val_ds)} cases")
 
-    # ── Frozen UNet ────────────────────────────────────────────────────────
-    if not os.path.exists(cfg.unet_ckpt):
-        raise FileNotFoundError(
-            f"UNet checkpoint not found: '{cfg.unet_ckpt}'\n"
-            "Run Phase 1 (train_unet) first, or set cfg.unet_ckpt correctly."
-        )
-    unet = SimpleUNet3D(
-        n_classes     = cfg.num_classes,
-        base_channels = cfg.unet_base_channels,
-        trilinear     = cfg.unet_trilinear,
-    ).to(device)
-    unet_ckpt = torch.load(cfg.unet_ckpt, map_location=device)
-    # Strip the "_orig_mod." prefix that torch.compile() adds to state_dict keys
-    # so the checkpoint loads cleanly into a plain (uncompiled) SimpleUNet3D.
-    unet.load_state_dict({
-        k.removeprefix("_orig_mod."): v
-        for k, v in unet_ckpt["model_state"].items()
-    })
-    unet.eval()
-    for p in unet.parameters():
-        p.requires_grad_(False)
-    logger.info(
-        f"Frozen UNet loaded  "
-        f"(val_mean_dice={unet_ckpt.get('val_mean_dice', float('nan')):.4f})"
-    )
-
-    # ── Frozen OmniRad ─────────────────────────────────────────────────────
-    omnirad = OmniRadEncoder(device=device, frozen=True)
-    logger.info("OmniRad loaded and frozen.")
-
-    # ── Slice pooling (trainable when attention) ───────────────────────────
-    if cfg.slice_pooling == "attention":
-        pooling = GatedAttentionPooling(
-            embed_dim   = cfg.embed_dim,
-            hidden_size = cfg.attn_hidden_size,
-            dropout     = cfg.attn_dropout,
+    # ── Imaging pipeline (conditional on cfg.use_imaging) ──────────────────
+    if cfg.use_imaging:
+        if not os.path.exists(cfg.unet_ckpt):
+            raise FileNotFoundError(
+                f"UNet checkpoint not found: '{cfg.unet_ckpt}'\n"
+                "Run Phase 1 (train_unet) first, or set cfg.unet_ckpt correctly."
+            )
+        unet = SimpleUNet3D(
+            n_classes     = cfg.num_classes,
+            base_channels = cfg.unet_base_channels,
+            trilinear     = cfg.unet_trilinear,
         ).to(device)
-        n_attn = sum(p.numel() for p in pooling.parameters())
-        logger.info(f"GatedAttentionPooling  params: {n_attn:,}")
-    elif cfg.slice_pooling == "mean":
-        pooling = None
-        logger.info("Slice pooling: unweighted mean (no extra parameters).")
-    else:
-        raise ValueError(
-            f"Unknown slice_pooling='{cfg.slice_pooling}'. "
-            "Choose 'mean' or 'attention'."
+        unet_ckpt = torch.load(cfg.unet_ckpt, map_location=device)
+        unet.load_state_dict({
+            k.removeprefix("_orig_mod."): v
+            for k, v in unet_ckpt["model_state"].items()
+        })
+        unet.eval()
+        for p in unet.parameters():
+            p.requires_grad_(False)
+        logger.info(
+            f"Frozen UNet loaded  "
+            f"(val_mean_dice={unet_ckpt.get('val_mean_dice', float('nan')):.4f})"
         )
+
+        omnirad = OmniRadEncoder(device=device, frozen=True)
+        logger.info("OmniRad loaded and frozen.")
+
+        if cfg.slice_pooling == "attention":
+            pooling = GatedAttentionPooling(
+                embed_dim   = cfg.embed_dim,
+                hidden_size = cfg.attn_hidden_size,
+                dropout     = cfg.attn_dropout,
+            ).to(device)
+            n_attn = sum(p.numel() for p in pooling.parameters())
+            logger.info(f"GatedAttentionPooling  params: {n_attn:,}")
+        elif cfg.slice_pooling == "mean":
+            pooling = None
+            logger.info("Slice pooling: unweighted mean (no extra parameters).")
+        else:
+            raise ValueError(
+                f"Unknown slice_pooling='{cfg.slice_pooling}'. "
+                "Choose 'mean' or 'attention'."
+            )
+    else:
+        unet    = None
+        omnirad = None
+        pooling = None
+
+    # ── Clinical MLP (conditional on cfg.use_clinical) ───────────────────
+    clinical_feats_train: dict = {}
+    clinical_feats_val:   dict = {}
+    clinical_mlp = None
+
+    if cfg.use_clinical:
+        metadata_path = os.path.join(cfg.root_dir, "kits23.json")
+        cp = ClinicalPreprocessor(
+            metadata_path     = metadata_path,
+            missing_threshold = cfg.missing_threshold,
+        )
+        clinical_feats_train, clinical_feats_val, clin_dim = cp.fit_transform(
+            train_ids = train_ds.cases,
+            val_ids   = val_ds.cases,
+        )
+        cp.save(cfg.clinical_preprocessor_path)
+        logger.info(
+            f"Clinical MLP: input_dim={clin_dim}  "
+            f"output_dim={cfg.clinical_dim}"
+        )
+        clinical_mlp = ClinicalMLP(
+            input_dim   = clin_dim,
+            output_dim  = cfg.clinical_dim,
+            hidden_dims = cfg.clinical_hidden_dims,
+            dropout     = cfg.clinical_dropout,
+        ).to(device)
+        n_clin = sum(p.numel() for p in clinical_mlp.parameters())
+        logger.info(f"ClinicalMLP            params: {n_clin:,}")
+        wandb.log({"model/clinical_mlp_params": n_clin}, step=0)
 
     # ── EGMDM Head ─────────────────────────────────────────────────────────
     egmdm = EGMDMHead(
-        input_size  = cfg.embed_dim,
+        input_size  = cfg.egmdm_input_dim,  # embed_dim [+ clinical_dim]
         hidden_size = cfg.egmdm_hidden_size,
         E           = cfg.egmdm_E,
         K           = cfg.egmdm_K,
@@ -256,6 +291,8 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
     trainable_params = list(egmdm.parameters())
     if pooling is not None:
         trainable_params += list(pooling.parameters())
+    if clinical_mlp is not None:
+        trainable_params += list(clinical_mlp.parameters())
 
     criterion = EGMDMLoss(lambda_div=cfg.lambda_div, lambda_ent=cfg.lambda_ent)
     optimizer = optim.AdamW(trainable_params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
@@ -271,6 +308,8 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
         egmdm.load_state_dict(saved["egmdm_state"])
         if pooling is not None and "pooling_state" in saved:
             pooling.load_state_dict(saved["pooling_state"])
+        if clinical_mlp is not None and "clinical_mlp_state" in saved:
+            clinical_mlp.load_state_dict(saved["clinical_mlp_state"])
         optimizer.load_state_dict(saved["optimizer_state"])
         scheduler.load_state_dict(saved["scheduler_state"])
         start_epoch    = saved["epoch"] + 1
@@ -295,6 +334,8 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
         egmdm.train()
         if pooling is not None:
             pooling.train()
+        if clinical_mlp is not None:
+            clinical_mlp.train()
         tr_loss = tr_nll = 0.0
 
         pbar = tqdm(train_loader, desc=f"  Train [{epoch}]", leave=False)
@@ -304,16 +345,26 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
             event   = batch["event"][0]
             t_day   = batch["survival_time"][0]
 
-            emb, _ = embed_patient(
-                ct      = ct,
-                unet    = unet,
-                omnirad = omnirad,
-                pooling = pooling,
-                cfg     = cfg,
-                device  = device,
-                gt_mask = gt_mask,
-            )
-            emb = emb.unsqueeze(0).to(device)   # (1, embed_dim)
+            parts = []
+            if cfg.use_imaging:
+                img_emb, _ = embed_patient(
+                    ct      = ct,
+                    unet    = unet,
+                    omnirad = omnirad,
+                    pooling = pooling,
+                    cfg     = cfg,
+                    device  = device,
+                    gt_mask = gt_mask,
+                )
+                parts.append(img_emb)                    # (embed_dim,)
+            if clinical_mlp is not None:
+                cid      = batch["caseid"][0]
+                clin_vec = clinical_feats_train.get(cid)
+                if clin_vec is not None:
+                    parts.append(
+                        clinical_mlp(clin_vec.to(device)).cpu()
+                    )                                    # (clinical_dim,)
+            emb = torch.cat(parts, dim=0).unsqueeze(0).to(device)  # (1, egmdm_input_dim)
 
             params, reg = egmdm(emb)
             t = (t_day / 365.25).unsqueeze(0).to(device)
@@ -336,6 +387,8 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
         egmdm.eval()
         if pooling is not None:
             pooling.eval()
+        if clinical_mlp is not None:
+            clinical_mlp.eval()
         vl_loss = vl_nll = 0.0
         all_risks, all_times, all_events = [], [], []
         # Collect attention weights from the last val epoch for W&B logging
@@ -348,16 +401,27 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
                 event   = batch["event"][0]
                 t_day   = batch["survival_time"][0]
 
-                emb, attn_w = embed_patient(
-                    ct      = ct,
-                    unet    = unet,
-                    omnirad = omnirad,
-                    pooling = pooling,
-                    cfg     = cfg,
-                    device  = device,
-                    gt_mask = gt_mask,
-                )
-                emb = emb.unsqueeze(0).to(device)
+                parts   = []
+                attn_w  = None
+                if cfg.use_imaging:
+                    img_emb, attn_w = embed_patient(
+                        ct      = ct,
+                        unet    = unet,
+                        omnirad = omnirad,
+                        pooling = pooling,
+                        cfg     = cfg,
+                        device  = device,
+                        gt_mask = gt_mask,
+                    )
+                    parts.append(img_emb)
+                if clinical_mlp is not None:
+                    cid      = batch["caseid"][0]
+                    clin_vec = clinical_feats_val.get(cid)
+                    if clin_vec is not None:
+                        parts.append(
+                            clinical_mlp(clin_vec.to(device)).cpu()
+                        )
+                emb = torch.cat(parts, dim=0).unsqueeze(0).to(device)
 
                 params, reg = egmdm(emb)
                 t = (t_day / 365.25).unsqueeze(0).to(device)
@@ -433,6 +497,8 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
         }
         if pooling is not None:
             ckpt_payload["pooling_state"] = pooling.state_dict()
+        if clinical_mlp is not None:
+            ckpt_payload["clinical_mlp_state"] = clinical_mlp.state_dict()
 
         torch.save(ckpt_payload, cfg.last_ckpt)
 

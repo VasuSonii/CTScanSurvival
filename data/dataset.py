@@ -52,9 +52,10 @@ class KitsDataset(Dataset):
             splits = json.load(f)
         self.cases = splits.get(self.mode, splits.get("train"))
 
-        with open(self.metadata_path, "r") as f:
-            for entry in json.load(f):
-                self.metadata[entry["case_id"]] = entry
+        if self.metadata_path is not None:
+            with open(self.metadata_path, "r") as f:
+                for entry in json.load(f):
+                    self.metadata[entry["case_id"]] = entry
 
     # ── Dataset protocol ──────────────────────────────────────────────────
 
@@ -65,8 +66,8 @@ class KitsDataset(Dataset):
         caseid = self.cases[index]
 
         image = sitk.ReadImage(os.path.join(self.rootdir, caseid, "imaging.nii.gz"))
-        mask  = sitk.ReadImage(os.path.join(self.rootdir, caseid, "aggregated_MAJ_seg.nii.gz"))
-
+        # mask  = sitk.ReadImage(os.path.join(self.rootdir, caseid, "aggregated_MAJ_seg.nii.gz"))
+        mask  = sitk.ReadImage(os.path.join(self.rootdir, caseid, "segmentation.nii.gz"))
         image = sitk.DICOMOrient(image, "RAS")
         mask  = sitk.DICOMOrient(mask,  "RAS")
 
@@ -185,10 +186,11 @@ class KitsDataset(Dataset):
         event         : True if patient died (vital_status == 'dead')
         survival_time : days after surgery (vital_days_after_surgery)
         """
-        meta          = self.metadata[caseid]
-        event         = meta["vital_status"] == "dead"
-        survival_time = meta.get("vital_days_after_surgery") or 0.0
-        return bool(event), float(survival_time)
+        if self.metadata_path is not None:
+            meta          = self.metadata[caseid]
+            event         = meta["vital_status"] == "dead"
+            survival_time = meta.get("vital_days_after_surgery") or 0.0
+            return bool(event), float(survival_time)
 
 RGB_HU_WINDOWS = [
     (-150.0, 250.0),   # R — soft tissue / renal parenchyma

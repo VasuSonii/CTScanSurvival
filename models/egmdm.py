@@ -180,6 +180,6 @@ class EGMDMHead(nn.Module):
         if self.E > 1:
             centers = mu_stack.mean(dim=2)
             reg_losses["L_div"] = -torch.var(centers, dim=1).mean()
-        reg_losses["L_ent"] = -(G * (G + 1e-8).log()).sum(-1).mean()
+        reg_losses["L_ent"] = (G * (G + 1e-8).log()).sum(-1).mean()
 
         return params, reg_losses

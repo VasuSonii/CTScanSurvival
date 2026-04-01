@@ -37,7 +37,7 @@ os.environ["WANDB_MODE"] = "offline"
 
 SEEDS = [456, 789, 1011, 1213, 1415, 1617, 1819, 2021]
 
-GPUS = ["cuda:0", "cuda:1", "cuda:3"]   # one worker slot per GPU
+GPUS = ["cuda:1", "cuda:2", "cuda:3"]   # one worker slot per GPU
 
 BASE_CONFIG = dict(
     experiment_name   = "survival_baseline",
@@ -58,7 +58,7 @@ BASE_CONFIG = dict(
     learning_rate         = 1e-4,
     weight_decay          = 1e-4,
     early_stop_patience   = 20,
-    num_workers           = 8,   # 3 processes × 8 = 24 CPU workers total
+    num_workers           = 16,   # 3 processes × 8 = 24 CPU workers total
 )
 
 
