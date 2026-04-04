@@ -43,7 +43,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 load_dotenv()
-os.environ["WANDB_MODE"] = "offline"
+
 from configs.survival_config import SurvivalConfig
 from data.dataset            import KitsDataset
 from losses.survival_loss    import EGMDMLoss
@@ -61,51 +61,28 @@ from models.clinical_mlp        import ClinicalMLP
 # ─── Patient embedding pipeline ───────────────────────────────────────────────
 
 @torch.no_grad()
-def embed_patient(
-    ct:       torch.Tensor,                       # (D, H, W) float32 on CPU
+def get_slice_embeddings(
+    ct:       torch.Tensor,               # (D, H, W) float32 on CPU
     unet:     torch.nn.Module,
     omnirad:  OmniRadEncoder,
-    pooling:  torch.nn.Module,                    # GatedAttentionPooling or identity
     cfg:      SurvivalConfig,
     device:   torch.device,
-    gt_mask:  torch.Tensor | None = None,         # (D, H, W) int64 on CPU
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+    gt_mask:  torch.Tensor | None = None,
+) -> torch.Tensor:
     """
-    Build a patient-level embedding vector from a CT volume.
+    Steps 1-2 only: mask prediction + OmniRad encoding.
+    Returns slice_embs (D, embed_dim) on CPU, fully detached.
 
-    Pipeline
-    --------
-    1. Obtain segmentation mask:
-         - cfg.use_gt_mask=True  → use gt_mask directly (must be provided)
-         - cfg.use_gt_mask=False → run frozen UNet in sliding-window mode
-    2. OmniRad encodes every (CT slice, mask slice) pair → (D, embed_dim) on CPU.
-    3. Pool across depth with the chosen pooling module:
-         - "mean"      → unweighted mean → (embed_dim,) on CPU
-         - "attention" → gated attention → (embed_dim,) on CPU
-                         also returns (D,) attention weights for logging
-
-    Parameters
-    ----------
-    ct      : (D, H, W) CT volume normalised to [0, 1], on CPU
-    unet    : frozen SimpleUNet3D — only used when cfg.use_gt_mask is False
-    omnirad : frozen OmniRadEncoder
-    pooling : GatedAttentionPooling (trainable) when cfg.slice_pooling="attention",
-              or torch.nn.Identity (passthrough) when cfg.slice_pooling="mean"
-    cfg     : SurvivalConfig — controls use_gt_mask, slice_pooling, etc.
-    device  : GPU/CPU device for UNet inference and attention
-    gt_mask : (D, H, W) int64 ground-truth mask from the dataset batch;
-              required when cfg.use_gt_mask is True, ignored otherwise
-
-    Returns
-    -------
-    embedding      : (embed_dim,) tensor on CPU
-    attn_weights   : (D,) tensor on CPU if slice_pooling="attention", else None
+    Pooling is intentionally NOT done here so that GatedAttentionPooling
+    runs inside the training loop where the computation graph is live.
+    Previously pooling was called inside @no_grad then moved to CPU which
+    broke the gradient path: emb.cpu() detaches from the graph, so
+    pooling received zero gradients despite torch.enable_grad().
     """
-    # ── Step 1: mask ──────────────────────────────────────────────────────
     if cfg.use_gt_mask:
         if gt_mask is None:
             raise ValueError("cfg.use_gt_mask is True but gt_mask was not provided.")
-        mask = gt_mask   # (D, H, W) int64 on CPU
+        mask = gt_mask
     else:
         mask = sliding_window_predict(
             model       = unet,
@@ -114,25 +91,41 @@ def embed_patient(
             window      = cfg.sw_window,
             stride      = cfg.sw_stride,
             device      = device,
-        )   # (D, H, W) int64 on CPU
+        )
 
-    # ── Step 2: per-slice OmniRad embeddings ──────────────────────────────
-    slice_embs = omnirad.encode_volume(
+    return omnirad.encode_volume(
         ct          = ct,
         mask        = mask,
         num_classes = cfg.num_classes,
         batch_size  = cfg.omni_batch,
-    )   # (D, embed_dim) on CPU
+    )   # (D, embed_dim) on CPU, detached
 
-    # ── Step 3: pool across depth ─────────────────────────────────────────
-    if cfg.slice_pooling == "attention":
-        # Attention is trainable — run with grad enabled even though this
-        # function is decorated @no_grad; we re-enable it explicitly here.
-        with torch.enable_grad():
-            emb, attn_weights = pooling(slice_embs.to(device))
-        return emb.cpu(), attn_weights.detach().cpu()
+
+def pool_slice_embeddings(
+    slice_embs: torch.Tensor,            # (D, embed_dim) on CPU
+    pooling:    torch.nn.Module | None,  # GatedAttentionPooling or None
+    cfg:        SurvivalConfig,
+    device:     torch.device,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """
+    Step 3: pool (D, embed_dim) → (embed_dim,) on GPU, keeping grad alive.
+
+    Called inside the training loop (grad context active) so gradients
+    flow correctly back through GatedAttentionPooling.
+    The returned embedding stays on GPU — do NOT move to CPU before backward.
+
+    Returns
+    -------
+    emb          : (embed_dim,) on device  ← stays on GPU for backward
+    attn_weights : (D,) on CPU or None
+    """
+    embs_gpu = slice_embs.to(device)   # (D, embed_dim) on GPU
+
+    if cfg.slice_pooling == "attention" and pooling is not None:
+        emb, attn_weights = pooling(embs_gpu)   # (embed_dim,) on GPU, grad alive
+        return emb, attn_weights.detach().cpu()
     else:
-        return slice_embs.mean(dim=0), None   # (embed_dim,) on CPU
+        return embs_gpu.mean(dim=0), None       # (embed_dim,) on GPU
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -336,7 +329,11 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
             pooling.train()
         if clinical_mlp is not None:
             clinical_mlp.train()
-        tr_loss = tr_nll = 0.0
+        tr_loss = tr_nll = tr_reg_div = tr_reg_ent = 0.0
+        # Diagnostic accumulators
+        tr_img_norm  = tr_clin_norm  = 0.0   # embedding L2 norms
+        tr_grad_egmdm = tr_grad_pool = tr_grad_clin = 0.0
+        tr_n = 0
 
         pbar = tqdm(train_loader, desc=f"  Train [{epoch}]", leave=False)
         for batch in pbar:
@@ -345,26 +342,31 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
             event   = batch["event"][0]
             t_day   = batch["survival_time"][0]
 
-            parts = []
+            parts = []   # all tensors stay on GPU for backward
             if cfg.use_imaging:
-                img_emb, _ = embed_patient(
-                    ct      = ct,
-                    unet    = unet,
-                    omnirad = omnirad,
-                    pooling = pooling,
-                    cfg     = cfg,
-                    device  = device,
-                    gt_mask = gt_mask,
+                # Step 1+2: frozen (no_grad), returns CPU tensor
+                slice_embs = get_slice_embeddings(
+                    ct=ct, unet=unet, omnirad=omnirad,
+                    cfg=cfg, device=device, gt_mask=gt_mask,
                 )
-                parts.append(img_emb)                    # (embed_dim,)
+                # Step 3: pooling runs with grad, stays on GPU
+                img_emb, _ = pool_slice_embeddings(
+                    slice_embs=slice_embs, pooling=pooling,
+                    cfg=cfg, device=device,
+                )
+                # L2-normalise so imaging and clinical live on same scale
+                img_emb_n = torch.nn.functional.normalize(img_emb, dim=0)
+                parts.append(img_emb_n)
+                tr_img_norm += img_emb.norm().item()   # log pre-norm for diagnosis
             if clinical_mlp is not None:
                 cid      = batch["caseid"][0]
                 clin_vec = clinical_feats_train.get(cid)
                 if clin_vec is not None:
-                    parts.append(
-                        clinical_mlp(clin_vec.to(device)).cpu()
-                    )                                    # (clinical_dim,)
-            emb = torch.cat(parts, dim=0).unsqueeze(0).to(device)  # (1, egmdm_input_dim)
+                    clin_emb = clinical_mlp(clin_vec.to(device))  # on GPU
+                    clin_emb_n = torch.nn.functional.normalize(clin_emb, dim=0)
+                    parts.append(clin_emb_n)
+                    tr_clin_norm += clin_emb.norm().item()
+            emb = torch.cat(parts, dim=0).unsqueeze(0)  # (1, egmdm_input_dim) on GPU
 
             params, reg = egmdm(emb)
             t = (t_day / 365.25).unsqueeze(0).to(device)
@@ -373,15 +375,38 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
             loss, nll = criterion(egmdm, params, reg, t, e)
             optimizer.zero_grad()
             loss.backward()
+
+            # Collect per-module gradient norms BEFORE clipping
+            def _grad_norm(params_iter):
+                g = [p.grad.detach().norm() for p in params_iter if p.grad is not None]
+                return torch.stack(g).norm().item() if g else 0.0
+            tr_grad_egmdm += _grad_norm(egmdm.parameters())
+            if pooling is not None:
+                tr_grad_pool  += _grad_norm(pooling.parameters())
+            if clinical_mlp is not None:
+                tr_grad_clin  += _grad_norm(clinical_mlp.parameters())
+            tr_n += 1
+
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
 
             tr_loss += loss.item()
             tr_nll  += nll.item()
+            # Track reg components separately
+            tr_reg_div += reg.get('L_div', torch.tensor(0.0)).item()
+            tr_reg_ent += reg.get('L_ent', torch.tensor(0.0)).item()
             pbar.set_postfix(loss=f"{loss.item():.4f}", nll=f"{nll.item():.4f}")
 
-        avg_tr_loss = tr_loss / len(train_loader)
-        avg_tr_nll  = tr_nll  / len(train_loader)
+        n = max(tr_n, 1)
+        avg_tr_loss      = tr_loss      / len(train_loader)
+        avg_tr_nll       = tr_nll       / len(train_loader)
+        avg_tr_reg_div   = tr_reg_div   / len(train_loader)
+        avg_tr_reg_ent   = tr_reg_ent   / len(train_loader)
+        avg_img_norm     = tr_img_norm  / n
+        avg_clin_norm    = tr_clin_norm / n
+        avg_grad_egmdm   = tr_grad_egmdm / n
+        avg_grad_pool    = tr_grad_pool  / n
+        avg_grad_clin    = tr_grad_clin  / n
 
         # ── Val ────────────────────────────────────────────────────────────
         egmdm.eval()
@@ -391,8 +416,15 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
             clinical_mlp.eval()
         vl_loss = vl_nll = 0.0
         all_risks, all_times, all_events = [], [], []
-        # Collect attention weights from the last val epoch for W&B logging
-        all_attn: list[torch.Tensor] = []
+        all_attn:        list[torch.Tensor] = []
+        all_img_norms:   list[float]        = []
+        all_clin_norms:  list[float]        = []
+        all_sigma_mean:  list[float]        = []
+        all_sigma_min:   list[float]        = []
+        all_mix_entropy: list[float]        = []
+        all_attn_max:    list[float]        = []
+        all_reg_div:     list[float]        = []
+        all_reg_ent:     list[float]        = []
 
         with torch.no_grad():
             for batch in tqdm(val_loader, desc=f"  Val   [{epoch}]", leave=False):
@@ -403,25 +435,30 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
 
                 parts   = []
                 attn_w  = None
+                _img_n = _clin_n = 0.0
                 if cfg.use_imaging:
-                    img_emb, attn_w = embed_patient(
-                        ct      = ct,
-                        unet    = unet,
-                        omnirad = omnirad,
-                        pooling = pooling,
-                        cfg     = cfg,
-                        device  = device,
-                        gt_mask = gt_mask,
+                    slice_embs = get_slice_embeddings(
+                        ct=ct, unet=unet, omnirad=omnirad,
+                        cfg=cfg, device=device, gt_mask=gt_mask,
                     )
-                    parts.append(img_emb)
+                    img_emb, attn_w = pool_slice_embeddings(
+                        slice_embs=slice_embs, pooling=pooling,
+                        cfg=cfg, device=device,
+                    )
+                    _img_n = img_emb.norm().item()
+                    img_emb_n = torch.nn.functional.normalize(img_emb, dim=0)
+                    parts.append(img_emb_n)
                 if clinical_mlp is not None:
                     cid      = batch["caseid"][0]
                     clin_vec = clinical_feats_val.get(cid)
                     if clin_vec is not None:
-                        parts.append(
-                            clinical_mlp(clin_vec.to(device)).cpu()
-                        )
-                emb = torch.cat(parts, dim=0).unsqueeze(0).to(device)
+                        clin_emb   = clinical_mlp(clin_vec.to(device))
+                        _clin_n    = clin_emb.norm().item()
+                        clin_emb_n = torch.nn.functional.normalize(clin_emb, dim=0)
+                        parts.append(clin_emb_n)
+                all_img_norms.append(_img_n)
+                all_clin_norms.append(_clin_n)
+                emb = torch.cat(parts, dim=0).unsqueeze(0)  # on GPU
 
                 params, reg = egmdm(emb)
                 t = (t_day / 365.25).unsqueeze(0).to(device)
@@ -437,6 +474,20 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
                 all_events.append(event.cpu())
                 if attn_w is not None:
                     all_attn.append(attn_w)
+                # Sigma diagnostics — collapse to 0 = memorisation
+                all_sigma_mean.append(params['sigma'].mean().item())
+                all_sigma_min.append(params['sigma'].min().item())
+                # Mixture entropy — low = model is overconfident
+                w = params['w'].clamp(1e-8, 1.0)
+                mix_ent = -(w * w.log()).sum(-1).mean().item()
+                all_mix_entropy.append(mix_ent)
+                # Attention saturation — max weight → 1 means collapsed
+                if attn_w is not None:
+                    all_attn_max.append(attn_w.max().item())
+                # Reg loss components
+                _, reg_v = egmdm(emb)
+                all_reg_div.append(reg_v.get('L_div', torch.tensor(0.0)).item())
+                all_reg_ent.append(reg_v.get('L_ent', torch.tensor(0.0)).item())
 
         avg_vl_loss = vl_loss / len(val_loader)
         avg_vl_nll  = vl_nll  / len(val_loader)
@@ -456,13 +507,34 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
         )
 
         wb_log: dict = {
-            "train/lr":        lr,
-            "train/loss":      avg_tr_loss,
-            "train/nll":       avg_tr_nll,
-            "val/loss":        avg_vl_loss,
-            "val/nll":         avg_vl_nll,
-            "val/cindex":      c_index,
-            "val/best_cindex": max(best_cindex, c_index),
+            "train/lr":              lr,
+            "train/loss":            avg_tr_loss,
+            "train/nll":             avg_tr_nll,
+            # Embedding norm — high imaging vs low clinical → imaging dominates
+            "train/img_emb_norm":    avg_img_norm,
+            "train/clin_emb_norm":   avg_clin_norm,
+            # Gradient norms — tells which module is actually learning
+            "train/grad_egmdm":      avg_grad_egmdm,
+            "train/grad_pooling":    avg_grad_pool,
+            "train/grad_clinical":   avg_grad_clin,
+            "val/loss":              avg_vl_loss,
+            "val/nll":               avg_vl_nll,
+            "val/cindex":            c_index,
+            "val/best_cindex":       max(best_cindex, c_index),
+            # Val embedding norms
+            "val/img_emb_norm":      sum(all_img_norms)  / max(len(all_img_norms),  1),
+            "val/clin_emb_norm":     sum(all_clin_norms) / max(len(all_clin_norms), 1),
+            # EGMDM distribution diagnostics
+            "val/sigma_mean":        sum(all_sigma_mean)  / max(len(all_sigma_mean),  1),
+            "val/sigma_min":         sum(all_sigma_min)   / max(len(all_sigma_min),   1),
+            "val/mixture_entropy":   sum(all_mix_entropy) / max(len(all_mix_entropy), 1),
+            # Attention saturation
+            "val/attn_max_weight":   sum(all_attn_max) / max(len(all_attn_max), 1) if all_attn_max else 0.0,
+            # Reg loss components
+            "train/reg_div":         avg_tr_reg_div,
+            "train/reg_ent":         avg_tr_reg_ent,
+            "val/reg_div":           sum(all_reg_div) / max(len(all_reg_div), 1),
+            "val/reg_ent":           sum(all_reg_ent) / max(len(all_reg_ent), 1),
         }
         # Log mean attention weight entropy as a measure of how focused
         # the model's attention is across slices.  Each patient has a

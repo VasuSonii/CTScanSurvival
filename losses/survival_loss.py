@@ -22,10 +22,11 @@ class EGMDMLoss(nn.Module):
     lambda_ent : weight for gate-entropy regularisation    (L_ent)
     """
 
-    def __init__(self, lambda_div: float = 0.1, lambda_ent: float = 0.01):
+    def __init__(self, lambda_div: float = 0.1, lambda_ent: float = 0.01, lambda_mix: float = 0.1):
         super().__init__()
         self.lambda_div = lambda_div
         self.lambda_ent = lambda_ent
+        self.lambda_mix = lambda_mix
 
     def forward(
         self,
@@ -54,5 +55,7 @@ class EGMDMLoss(nn.Module):
             total_loss = total_loss + self.lambda_div * reg_losses["L_div"]
         if "L_ent" in reg_losses:
             total_loss = total_loss + self.lambda_ent * reg_losses["L_ent"]
+        if "L_mix" in reg_losses:
+            total_loss = total_loss + self.lambda_mix * reg_losses["L_mix"]
 
         return total_loss, nll

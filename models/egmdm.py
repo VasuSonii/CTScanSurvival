@@ -178,8 +178,26 @@ class EGMDMHead(nn.Module):
 
         reg_losses: dict = {}
         if self.E > 1:
-            centers = mu_stack.mean(dim=2)
-            reg_losses["L_div"] = -torch.var(centers, dim=1).mean()
-        reg_losses["L_ent"] = (G * (G + 1e-8).log()).sum(-1).mean()
+            # Expert diversity: penalise when expert mean-centres are too similar.
+            centers = mu_stack.mean(dim=2)              # (B, E)
+            dists = []
+            for i in range(self.E):
+                for j in range(i + 1, self.E):
+                    dists.append((centers[:, i] - centers[:, j]).pow(2).mean())
+            mean_dist = torch.stack(dists).mean() if dists else torch.tensor(0.0)
+            reg_losses["L_div"] = torch.exp(-mean_dist)   # ∈ [0,1]: 0=spread, 1=collapsed
+
+        # Gate entropy: penalise gate certainty → all experts used equally.
+        reg_losses["L_ent"] = -(G * (G + 1e-8).log()).sum(-1).mean()
+
+        # Mixture weight entropy: penalise collapse of final mixture weights.
+        # L_ent only regulates which expert is chosen; this regulates whether
+        # each expert spreads weight across all K components or collapses to 1.
+        # val/mixture_entropy of 0.2 (vs ideal log(K)≈1.6 for K=5) means the
+        # model predicts the same narrow distribution for every patient, losing
+        # discriminative power and causing C-index to fall after early epochs.
+        w_flat = params["w"]                                    # (B, E*K)
+        mix_ent = -(w_flat * (w_flat + 1e-8).log()).sum(-1).mean()
+        reg_losses["L_mix"] = -mix_ent   # minimising -entropy = maximising entropy
 
         return params, reg_losses

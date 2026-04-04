@@ -30,7 +30,7 @@ from typing import Optional, Tuple
 class SurvivalConfig:
     # ── Experiment identity ────────────────────────────────────────────────
     experiment_name: str = "survival_baseline"
-    seed:            int = 42
+    seed:            int = 123
 
     # ── Data paths ─────────────────────────────────────────────────────────
     root_dir:  str = "/home/sandeep/RAW_DATA/kits23/dataset"
@@ -86,19 +86,19 @@ class SurvivalConfig:
 
     # ── EGMDM Head ─────────────────────────────────────────────────────────
     egmdm_E:           int   = 3
-    egmdm_K:           int   = 10
-    egmdm_hidden_size: int   = 256
-    egmdm_dropout:     float = 0.1
-
+    egmdm_K:           int   = 5
+    egmdm_hidden_size: int   = 128
+    egmdm_dropout:     float = 0.3
+    
     # ── Loss ───────────────────────────────────────────────────────────────
-    lambda_div: float = 0.1
-    lambda_ent: float = 0.01
-
+    lambda_div: float = 1
+    lambda_ent: float = 0.5
+    lambda_mix: float = 0.5    # mixture weight entropy — spread across K components
     # ── Training ───────────────────────────────────────────────────────────
     num_epochs:          int   = 100
     learning_rate:       float = 1e-4
-    weight_decay:        float = 1e-4
-    early_stop_patience: int   = 20
+    weight_decay:        float = 5e-3
+    early_stop_patience: int   = 15
     num_workers:         int   = 8
 
     # ── Modality flags ────────────────────────────────────────────────────
@@ -106,7 +106,7 @@ class SurvivalConfig:
     #   use_imaging=True,  use_clinical=False → imaging only
     #   use_imaging=False, use_clinical=True  → clinical only
     #   use_imaging=True,  use_clinical=True  → imaging + clinical
-    use_imaging:          bool  = True
+    use_imaging:          bool  = False
     use_clinical:         bool  = True
 
     # ── Clinical MLP ──────────────────────────────────────────────────────
@@ -119,11 +119,13 @@ class SurvivalConfig:
     wandb_project: str  = "kits23-survival"
     # notes : free-text shown on the W&B run page — describe the experiment,
     #         hypothesis, or anything you want searchable later.
-    wandb_notes:  str   = "Training Kits23 data with clinical data and imaging only and loss changed to +Lreg"
+    # wandb_notes:  str   = f"Training Kits23 data with clinical data and imaging only and loss changed to +Lreg"
+    wandb_notes:  str   = "Training Kits23 data with clinical data"
+
     # tags  : short labels for filtering/grouping in the W&B UI.
     #         e.g. ["gt_mask", "attention", "kits23"]
-    wandb_tags:   list  = field(default_factory=lambda: ["kits23", "clinical","imaging","gt_mask","attention", "42", "+LReg"])
-
+    # wandb_tags:   list  = field(default_factory=lambda: ["kits23", "clinical","imaging","gt_mask","attention", "123", "-LReg", "gradientfixed"])
+    wandb_tags:   list  = field(default_factory=lambda: ["kits23", "clinical","123", "-LReg", "gradientfixed"])
     # ── Derived (DO NOT set manually) ──────────────────────────────────────
     run_dir:                    str = field(init=False, repr=False)
     best_ckpt:                  str = field(init=False, repr=False)
@@ -131,7 +133,7 @@ class SurvivalConfig:
     log_dir:                    str = field(init=False, repr=False)
     egmdm_input_dim:            int = field(init=False, repr=False)
     clinical_preprocessor_path: str = field(init=False, repr=False)
-
+ 
     def __post_init__(self) -> None:
         if not self.use_imaging and not self.use_clinical:
             raise ValueError("At least one of use_imaging or use_clinical must be True.")
@@ -156,11 +158,11 @@ class SurvivalConfig:
         self.clinical_preprocessor_path = os.path.join(
             self.run_dir, "clinical_preprocessor.pkl"
         )
-
+ 
     def to_dict(self) -> dict:
         """
         Flat dict of every config value, suitable for wandb.init(config=...).
-
+ 
         Derived path fields are included so W&B / logs record exactly where
         this run's outputs landed.  Tuple fields are converted to strings so
         they display cleanly in the W&B config panel.
@@ -172,3 +174,4 @@ class SurvivalConfig:
         d["clinical_hidden_dims"] = str(d["clinical_hidden_dims"])
         d["wandb_tags"]           = str(d["wandb_tags"])
         return d
+ 
