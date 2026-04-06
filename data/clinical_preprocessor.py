@@ -292,3 +292,149 @@ class ClinicalPreprocessor:
     @property
     def feature_names(self) -> list[str]:
         return list(self._feat_names)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# HECKTOR-specific preprocessor
+# ═════════════════════════════════════════════════════════════════════════════
+
+class ClinicalPreprocessorHector:
+    """
+    Tabular preprocessing pipeline for HECKTOR Task 2 clinical data.
+
+    HECKTOR has very limited clinical features (~6 after dropping targets):
+      Age, Gender, Tobacco Consumption, Alcohol Consumption, Treatment, M-stage
+
+    Performance Status is dropped — typically >40% missing.
+    Gender, Tobacco, Alcohol, Treatment are already numeric (0/1/2) but
+    treated as categorical for proper one-hot encoding since they are codes
+    not ordinal quantities.
+    M-stage is string categorical (M0, M1, Mx).
+
+    After encoding expect ~8-12 features total.  Use clinical_dim=32 output
+    in ClinicalMLP — 128 would be overparameterised for this input size.
+    """
+
+    def __init__(self, metadata_path: str, missing_threshold: float = 0.40):
+        self.metadata_path     = metadata_path
+        self.missing_threshold = missing_threshold
+        self._pipeline:   Optional[ColumnTransformer] = None
+        self._feat_names: list[str] = []
+        self._drop_cols:  list[str] = []
+        self._df:         Optional[pd.DataFrame] = None
+
+    def _load(self) -> pd.DataFrame:
+        df = pd.read_csv(self.metadata_path)
+        if "PatientID" in df.columns:
+            df = df.set_index("PatientID", drop=False)
+        return df
+
+    def fit_transform(
+        self,
+        train_ids: list[str],
+        val_ids:   list[str],
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], int]:
+        if self._df is None:
+            self._df = self._load()
+        df = self._df
+
+        # Always-excluded: identifiers, targets, and high-missing cols
+        always_drop = {"PatientID", "CenterID", "RFS", "Relapse", "Performance Status"}
+
+        # Drop additional high-missingness columns (computed on train only)
+        train_df = df.loc[df.index.isin(train_ids)]
+        missing_frac = train_df.isnull().mean()
+        high_missing = set(missing_frac[missing_frac > 0.9].index)
+        self._drop_cols = list(always_drop | high_missing)
+
+        X = df.drop(columns=[c for c in self._drop_cols if c in df.columns])
+
+        # Age is the only truly continuous feature
+        numeric_cols     = ["Age"] if "Age" in X.columns else []
+        categorical_cols = [c for c in X.columns if c not in numeric_cols]
+
+        logger.info(
+            f"HECKTOR clinical features — numeric: {len(numeric_cols)}  "
+            f"categorical: {len(categorical_cols)}  "
+            f"(dropped {len(self._drop_cols)} cols)"
+        )
+
+        num_pipe = Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler",  StandardScaler()),
+        ])
+        cat_pipe = Pipeline([
+            ("to_str",  _CastToStr()),
+            # _CastToStr converts NaN → "nan"; use string "nan" as missing marker
+            ("imputer", SimpleImputer(
+                missing_values="nan", strategy="constant", fill_value="Unknown"
+            )),
+            ("onehot",  OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+        ])
+
+        self._pipeline = ColumnTransformer([
+            ("num", num_pipe, numeric_cols),
+            ("cat", cat_pipe, categorical_cols),
+        ])
+
+        X_train = X.loc[X.index.isin(train_ids)]
+        self._pipeline.fit(X_train)
+
+        cat_names = (
+            self._pipeline.named_transformers_["cat"]
+            .named_steps["onehot"]
+            .get_feature_names_out(categorical_cols)
+            .tolist()
+        ) if categorical_cols else []
+        self._feat_names = numeric_cols + cat_names
+        clinical_dim     = len(self._feat_names)
+        logger.info(f"HECKTOR clinical feature dim after encoding: {clinical_dim}")
+
+        train_feats = self._to_tensors(X, train_ids)
+        val_feats   = self._to_tensors(X, val_ids)
+        return train_feats, val_feats, clinical_dim
+
+    def _to_tensors(self, X: pd.DataFrame, ids: list[str]) -> dict[str, torch.Tensor]:
+        X_sub = X.loc[X.index.isin(ids)].copy()
+        arr   = self._pipeline.transform(X_sub).astype(np.float32)
+        tensors = {}
+        for i, cid in enumerate(X_sub.index):
+            tensors[cid] = torch.from_numpy(arr[i])
+        missing = set(ids) - set(tensors.keys())
+        if missing:
+            logger.warning(f"No HECKTOR clinical data for {len(missing)} cases: {missing}")
+        return tensors
+
+    def save(self, path: str) -> None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        payload = {
+            "pipeline":      self._pipeline,
+            "feat_names":    self._feat_names,
+            "drop_cols":     self._drop_cols,
+            "metadata_path": self.metadata_path,
+        }
+        with open(path, "wb") as f:
+            pickle.dump(payload, f)
+        logger.info(f"HECKTOR clinical preprocessor saved → {path}")
+
+    @classmethod
+    def load(cls, path: str) -> "ClinicalPreprocessorHector":
+        with open(path, "rb") as f:
+            payload = pickle.load(f)
+        obj = cls(metadata_path=payload["metadata_path"])
+        obj._pipeline   = payload["pipeline"]
+        obj._feat_names = payload["feat_names"]
+        obj._drop_cols  = payload.get("drop_cols", [])
+        logger.info(
+            f"HECKTOR clinical preprocessor loaded ← {path}  "
+            f"(dim={len(obj._feat_names)})"
+        )
+        return obj
+
+    @property
+    def feature_dim(self) -> int:
+        return len(self._feat_names)
+
+    @property
+    def feature_names(self) -> list[str]:
+        return list(self._feat_names)

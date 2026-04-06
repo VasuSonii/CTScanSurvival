@@ -16,14 +16,14 @@ from typing import Optional
 class HectorUNetConfig:
     # ── Experiment identity ────────────────────────────────────────────────
     experiment_name: str = "hector_unet"
-    seed:            int = 98
+    seed:            int = 42
 
     # ── Device ────────────────────────────────────────────────────────────
     device: str = "cuda:1"
 
     # ── Data paths ─────────────────────────────────────────────────────────
-    task1_dir:  str = "/home/sandeep/HECKTOR2025/HECKTOR_2025_Training_Data/Task 1"
-    split_file: str = "/home/sandeep/HECKTOR2025/HECKTOR_2025_Training_Data/dataset_split_fixed.json"
+    task1_dir:  str = "/home/sandeep/RAW_DATA/HECKTOR2025/HECKTOR_2025_Training_Data/Task 1"
+    split_file: str = "/home/sandeep/RAW_DATA/HECKTOR2025/HECKTOR_2025_Training_Data/dataset_split_fixed.json"
 
     # ── Resume ─────────────────────────────────────────────────────────────
     resume_path: Optional[str] = None
@@ -47,7 +47,7 @@ class HectorUNetConfig:
     weight_decay:        float = 1e-4
     accumulation_steps:  int   = 4
     early_stop_patience: int   = 30
-    num_workers:         int   = 8
+    num_workers:         int   = 20
 
     # ── Loss ───────────────────────────────────────────────────────────────
     # loss_type='dice'    → CEDiceLoss    (equal FP/FN penalty)
@@ -67,7 +67,11 @@ class HectorUNetConfig:
     sw_stride: tuple = (8,  128, 128)
 
     # ── W&B ────────────────────────────────────────────────────────────────
-    wandb_project: str = "hector-unet"
+    wandb_project: str  = "hector-unet-new"
+    # Use tags to filter runs by loss type, e.g. ["tversky", "alpha0.2"]
+    # loss_type is auto-added as a tag so you can always filter by it.
+    wandb_notes:   str  = ""
+    wandb_tags: list = field(default_factory=lambda: ['unet', 'tversky', 'alpha0.2', 'beta0.8', '42'])
 
     # ── Derived paths (DO NOT set manually) ────────────────────────────────
     run_dir:   str = field(init=False, repr=False)
@@ -76,7 +80,7 @@ class HectorUNetConfig:
     log_dir:   str = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self.run_dir   = os.path.join("runs", f"{self.experiment_name}_{self.loss_type}", f"seed_{self.seed}")
+        self.run_dir   = os.path.join("runs", self.experiment_name, f"seed_{self.seed}")
         self.best_ckpt = os.path.join(self.run_dir, "best.pth")
         self.last_ckpt = os.path.join(self.run_dir, "last.pth")
         self.log_dir   = self.run_dir
@@ -90,4 +94,5 @@ class HectorUNetConfig:
         d["target_shape"]   = str(d["target_shape"])
         d["sw_window"]      = str(d["sw_window"])
         d["sw_stride"]      = str(d["sw_stride"])
+        d["wandb_tags"]     = str(d["wandb_tags"])
         return d

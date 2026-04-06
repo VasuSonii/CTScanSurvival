@@ -60,7 +60,7 @@ class SurvivalConfig:
 
     # ── Device ────────────────────────────────────────────────────────────-
     # Override this to pin a run to a specific GPU (e.g. 'cuda:1').
-    device: str = "cuda:2"
+    device: str = "cuda:1"
 
     # ── Mask source ────────────────────────────────────────────────────────
     # True  → use the ground-truth segmentation mask from the dataset.
@@ -85,29 +85,40 @@ class SurvivalConfig:
     attn_dropout:           float = 0.25  # dropout inside the attention gate
 
     # ── EGMDM Head ─────────────────────────────────────────────────────────
+    # Capacity reduced to match dataset size (~240 patients).
+    # K=10, hidden=256 gave ~1.4M params — ~6000 params/patient = overfit.
+    # K=5, hidden=128 gives ~300K params — ~1250 params/patient.
     egmdm_E:           int   = 3
     egmdm_K:           int   = 5
     egmdm_hidden_size: int   = 128
     egmdm_dropout:     float = 0.3
-    
+
     # ── Loss ───────────────────────────────────────────────────────────────
-    lambda_div: float = 1
-    lambda_ent: float = 0.5
+    lambda_div: float = 1.0    # expert spread penalty, in [0,1]
+    lambda_ent: float = 0.5    # gate entropy — use all experts equally
     lambda_mix: float = 0.5    # mixture weight entropy — spread across K components
+
     # ── Training ───────────────────────────────────────────────────────────
     num_epochs:          int   = 100
     learning_rate:       float = 1e-4
-    weight_decay:        float = 5e-3
-    early_stop_patience: int   = 15
+    weight_decay:        float = 5e-3  # increased from 1e-4: ~240 patients needs strong L2
+    early_stop_patience: int   = 15    # reduced from 20: stop sooner after peak
     num_workers:         int   = 8
+
+    # ── Cross-validation ──────────────────────────────────────────────────
+    # When use_kfold=True, train_survival_kfold() runs n_folds experiments.
+    # fold_idx is set automatically per fold — do not set manually.
+    use_kfold: bool = False
+    n_folds:   int  = 5
+    fold_idx:  int  = -1    # -1 = not in kfold mode
 
     # ── Modality flags ────────────────────────────────────────────────────
     # Three valid combinations:
     #   use_imaging=True,  use_clinical=False → imaging only
     #   use_imaging=False, use_clinical=True  → clinical only
     #   use_imaging=True,  use_clinical=True  → imaging + clinical
-    use_imaging:          bool  = False
-    use_clinical:         bool  = True
+    use_imaging:          bool  = True
+    use_clinical:         bool  = False
 
     # ── Clinical MLP ──────────────────────────────────────────────────────
     clinical_dim:         int   = 128   # ClinicalMLP output size
@@ -116,16 +127,15 @@ class SurvivalConfig:
     missing_threshold:    float = 0.40
 
     # ── W&B ────────────────────────────────────────────────────────────────
-    wandb_project: str  = "kits23-survival"
+    wandb_project: str  = "kits23-survival-folds"
     # notes : free-text shown on the W&B run page — describe the experiment,
     #         hypothesis, or anything you want searchable later.
-    # wandb_notes:  str   = f"Training Kits23 data with clinical data and imaging only and loss changed to +Lreg"
-    wandb_notes:  str   = "Training Kits23 data with clinical data"
-
+    wandb_notes:  str   = ""
     # tags  : short labels for filtering/grouping in the W&B UI.
     #         e.g. ["gt_mask", "attention", "kits23"]
-    # wandb_tags:   list  = field(default_factory=lambda: ["kits23", "clinical","imaging","gt_mask","attention", "123", "-LReg", "gradientfixed"])
-    wandb_tags:   list  = field(default_factory=lambda: ["kits23", "clinical","123", "-LReg", "gradientfixed"])
+    wandb_tags: list = field(default_factory=lambda: ['123', 'imaging', 'attention', 'use_gt_mask', '5_fold'])
+    # wandb_tags: list = field(default_factory=lambda: ['123', 'clinical', '5_fold'])
+
     # ── Derived (DO NOT set manually) ──────────────────────────────────────
     run_dir:                    str = field(init=False, repr=False)
     best_ckpt:                  str = field(init=False, repr=False)
@@ -133,7 +143,7 @@ class SurvivalConfig:
     log_dir:                    str = field(init=False, repr=False)
     egmdm_input_dim:            int = field(init=False, repr=False)
     clinical_preprocessor_path: str = field(init=False, repr=False)
- 
+
     def __post_init__(self) -> None:
         if not self.use_imaging and not self.use_clinical:
             raise ValueError("At least one of use_imaging or use_clinical must be True.")
@@ -144,9 +154,17 @@ class SurvivalConfig:
             self._variant = "imaging"
         else:
             self._variant = "clinical"
-        self.run_dir   = os.path.join(
-            "runs", self.experiment_name, self._variant, f"seed_{self.seed}"
-        )
+        if self.fold_idx >= 0:
+            # k-fold: each fold writes to its own subdirectory
+            self.run_dir = os.path.join(
+                "runs", self.experiment_name, self._variant,
+                f"kfold_{self.n_folds}", f"seed_{self.seed}",
+                f"fold_{self.fold_idx}",
+            )
+        else:
+            self.run_dir = os.path.join(
+                "runs", self.experiment_name, self._variant, f"seed_{self.seed}"
+            )
         self.best_ckpt = os.path.join(self.run_dir, "best.pth")
         self.last_ckpt = os.path.join(self.run_dir, "last.pth")
         self.log_dir   = self.run_dir
@@ -158,11 +176,11 @@ class SurvivalConfig:
         self.clinical_preprocessor_path = os.path.join(
             self.run_dir, "clinical_preprocessor.pkl"
         )
- 
+
     def to_dict(self) -> dict:
         """
         Flat dict of every config value, suitable for wandb.init(config=...).
- 
+
         Derived path fields are included so W&B / logs record exactly where
         this run's outputs landed.  Tuple fields are converted to strings so
         they display cleanly in the W&B config panel.
@@ -174,4 +192,3 @@ class SurvivalConfig:
         d["clinical_hidden_dims"] = str(d["clinical_hidden_dims"])
         d["wandb_tags"]           = str(d["wandb_tags"])
         return d
- 

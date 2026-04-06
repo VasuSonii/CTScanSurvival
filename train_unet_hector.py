@@ -42,11 +42,15 @@ def train_unet_hector(cfg: HectorUNetConfig | None = None) -> str:
     logger, csv_path = setup_logging(cfg.log_dir, prefix="unet_hector")
 
     wandb.login(key=os.environ["WANDB_API_KEY"])
+    # loss_type is always added as a tag so runs can be filtered by it
+    _tags = list(cfg.wandb_tags or []) + [cfg.loss_type]
     run = wandb.init(
         project = cfg.wandb_project,
-        name    = f"{cfg.experiment_name}_seed{cfg.seed}",
+        name    = f"{cfg.experiment_name}_{cfg.loss_type}_seed{cfg.seed}",
         group   = cfg.experiment_name,
         config  = cfg.to_dict(),
+        notes   = cfg.wandb_notes or None,
+        tags    = _tags,
         reinit  = True,
     )
 
@@ -149,6 +153,8 @@ def train_unet_hector(cfg: HectorUNetConfig | None = None) -> str:
         tr_fp = {1: 0.0, 2: 0.0}   # class 1=tumour, 2=lymph
         tr_fn = {1: 0.0, 2: 0.0}
         tr_steps = 0
+        # Gradient norm accumulators — encoder, decoder, total
+        tr_grad_enc = tr_grad_dec = tr_grad_total = 0.0
         optimizer.zero_grad()
 
         pbar = tqdm(train_loader, desc=f"  Train [{epoch}]", leave=False)
@@ -168,6 +174,33 @@ def train_unet_hector(cfg: HectorUNetConfig | None = None) -> str:
 
             if step % cfg.accumulation_steps == 0:
                 scaler.unscale_(optimizer)
+
+                # Collect per-block grad norms BEFORE clipping
+                def _gnorm(module):
+                    gs = [p.grad.detach().norm()
+                          for p in module.parameters()
+                          if p.grad is not None]
+                    return torch.stack(gs).norm().item() if gs else 0.0
+
+                enc_norm = (_gnorm(raw_model.inc)
+                            + _gnorm(raw_model.down1)
+                            + _gnorm(raw_model.down2)
+                            + _gnorm(raw_model.down3)
+                            + _gnorm(raw_model.down4))
+                dec_norm = (_gnorm(raw_model.up1)
+                            + _gnorm(raw_model.up2)
+                            + _gnorm(raw_model.up3)
+                            + _gnorm(raw_model.up4)
+                            + _gnorm(raw_model.outc))
+                tot_norm = sum(
+                    p.grad.detach().norm().item() ** 2
+                    for p in raw_model.parameters()
+                    if p.grad is not None
+                ) ** 0.5
+                tr_grad_enc   += enc_norm
+                tr_grad_dec   += dec_norm
+                tr_grad_total += tot_norm
+
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
@@ -189,6 +222,11 @@ def train_unet_hector(cfg: HectorUNetConfig | None = None) -> str:
         avg_tr_seg  = tr_seg  / n
         avg_tr_fp   = {k: v / max(tr_steps, 1) for k, v in tr_fp.items()}
         avg_tr_fn   = {k: v / max(tr_steps, 1) for k, v in tr_fn.items()}
+        # Number of optimiser steps taken this epoch
+        n_opt_steps = max(tr_steps // cfg.accumulation_steps, 1)
+        avg_grad_enc   = tr_grad_enc   / n_opt_steps
+        avg_grad_dec   = tr_grad_dec   / n_opt_steps
+        avg_grad_total = tr_grad_total / n_opt_steps
 
         # ── Val ────────────────────────────────────────────────────────────
         raw_model.eval()
@@ -225,6 +263,10 @@ def train_unet_hector(cfg: HectorUNetConfig | None = None) -> str:
             f"seg={avg_tr_seg:.4f}"
         )
         logger.info(
+            f"  Grads  enc={avg_grad_enc:.4f}  "
+            f"dec={avg_grad_dec:.4f}  total={avg_grad_total:.4f}"
+        )
+        logger.info(
             f"  Train  tumour FP={avg_tr_fp[1]:.0f}  FN={avg_tr_fn[1]:.0f}  "
             f"lymph FP={avg_tr_fp[2]:.0f}  FN={avg_tr_fn[2]:.0f}"
         )
@@ -243,6 +285,10 @@ def train_unet_hector(cfg: HectorUNetConfig | None = None) -> str:
         logger.info(f"  Val    mean FG dice={val_mean_dice:.4f}")
         wandb.log({
             "train/lr":                lr,
+            # Gradient norms — encoder vs decoder health
+            "train/grad_encoder":      avg_grad_enc,
+            "train/grad_decoder":      avg_grad_dec,
+            "train/grad_total":        avg_grad_total,
             "train/loss":              avg_tr_loss,
             "train/ce_loss":           avg_tr_ce,
             "train/seg_loss":          avg_tr_seg,

@@ -283,16 +283,20 @@ class HectorTask2Dataset(Dataset):
         split_file:     str,
         target_spacing: tuple,
         target_shape:   tuple,
-        mode:           str = "train",
+        mode:           str  = "train",
+        case_ids:       list = None,   # override split file (k-fold)
     ):
         self.task2_dir      = task2_dir
         self.target_spacing = target_spacing
         self.target_shape   = target_shape
         self.mode           = mode
 
-        with open(split_file) as f:
-            splits = json.load(f)
-        self.cases = splits["task2"][mode]
+        if case_ids is not None:
+            self.cases = case_ids
+        else:
+            with open(split_file) as f:
+                splits = json.load(f)
+            self.cases = splits["task2"][mode]
 
         df = pd.read_csv(metadata_csv)
         df = df.set_index("PatientID")

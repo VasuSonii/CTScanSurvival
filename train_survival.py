@@ -33,6 +33,7 @@ C-index improves.
 """
 
 import csv
+import logging
 import os
 
 import torch
@@ -55,6 +56,9 @@ from utils.logging_utils     import log_config, setup_logging
 from utils.metrics           import concordance_index
 from utils.seed              import set_seed
 from data.clinical_preprocessor import ClinicalPreprocessor
+from utils.kfold                import (
+    get_all_case_ids, load_events_from_metadata, make_kfold_splits
+)
 from models.clinical_mlp        import ClinicalMLP
 
 
@@ -149,7 +153,11 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
     wandb.login(key=os.environ["WANDB_API_KEY"])
     run = wandb.init(
         project = cfg.wandb_project,
-        name    = f"{cfg.experiment_name}_{cfg._variant}_seed{cfg.seed}",
+        name    = (
+            f"{cfg.experiment_name}_{cfg._variant}_seed{cfg.seed}_fold{cfg.fold_idx}"
+            if cfg.fold_idx >= 0 else
+            f"{cfg.experiment_name}_{cfg._variant}_seed{cfg.seed}"
+        ),
         group   = cfg.experiment_name,
         config  = cfg.to_dict(),
         notes   = cfg.wandb_notes or None,
@@ -172,8 +180,11 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
         split_file     = cfg.json_path,
         metadata_path  = os.path.join(cfg.root_dir, "kits23.json"),
     )
-    train_ds = KitsDataset(**_ds_kwargs, mode="train")
-    val_ds   = KitsDataset(**_ds_kwargs, mode="val")
+    # In k-fold mode case_ids are injected via cfg; otherwise use split file
+    _train_ids = getattr(cfg, '_kfold_train_ids', None)
+    _val_ids   = getattr(cfg, '_kfold_val_ids',   None)
+    train_ds = KitsDataset(**_ds_kwargs, mode="train", case_ids=_train_ids)
+    val_ds   = KitsDataset(**_ds_kwargs, mode="val",   case_ids=_val_ids)
 
     _dl_kwargs = dict(
         batch_size         = 1,
@@ -189,28 +200,31 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
 
     # ── Imaging pipeline (conditional on cfg.use_imaging) ──────────────────
     if cfg.use_imaging:
-        if not os.path.exists(cfg.unet_ckpt):
-            raise FileNotFoundError(
-                f"UNet checkpoint not found: '{cfg.unet_ckpt}'\n"
-                "Run Phase 1 (train_unet) first, or set cfg.unet_ckpt correctly."
+        if not cfg.use_gt_mask:
+            if not os.path.exists(cfg.unet_ckpt):
+                raise FileNotFoundError(
+                    f"UNet checkpoint not found: '{cfg.unet_ckpt}'\n"
+                    "Run Phase 1 (train_unet) first, or set cfg.unet_ckpt correctly."
+                )
+            unet = SimpleUNet3D(
+                n_classes     = cfg.num_classes,
+                base_channels = cfg.unet_base_channels,
+                trilinear     = cfg.unet_trilinear,
+            ).to(device)
+            unet_ckpt = torch.load(cfg.unet_ckpt, map_location=device)
+            unet.load_state_dict({
+                k.removeprefix("_orig_mod."): v
+                for k, v in unet_ckpt["model_state"].items()
+            })
+            unet.eval()
+            for p in unet.parameters():
+                p.requires_grad_(False)
+            logger.info(
+                f"Frozen UNet loaded  "
+                f"(val_mean_dice={unet_ckpt.get('val_mean_dice', float('nan')):.4f})"
             )
-        unet = SimpleUNet3D(
-            n_classes     = cfg.num_classes,
-            base_channels = cfg.unet_base_channels,
-            trilinear     = cfg.unet_trilinear,
-        ).to(device)
-        unet_ckpt = torch.load(cfg.unet_ckpt, map_location=device)
-        unet.load_state_dict({
-            k.removeprefix("_orig_mod."): v
-            for k, v in unet_ckpt["model_state"].items()
-        })
-        unet.eval()
-        for p in unet.parameters():
-            p.requires_grad_(False)
-        logger.info(
-            f"Frozen UNet loaded  "
-            f"(val_mean_dice={unet_ckpt.get('val_mean_dice', float('nan')):.4f})"
-        )
+        else:
+            unet = None
 
         omnirad = OmniRadEncoder(device=device, frozen=True)
         logger.info("OmniRad loaded and frozen.")
@@ -287,7 +301,7 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
     if clinical_mlp is not None:
         trainable_params += list(clinical_mlp.parameters())
 
-    criterion = EGMDMLoss(lambda_div=cfg.lambda_div, lambda_ent=cfg.lambda_ent)
+    criterion = EGMDMLoss(lambda_div=cfg.lambda_div, lambda_ent=cfg.lambda_ent, lambda_mix=cfg.lambda_mix)
     optimizer = optim.AdamW(trainable_params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.num_epochs, eta_min=1e-6)
 
@@ -425,6 +439,7 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
         all_attn_max:    list[float]        = []
         all_reg_div:     list[float]        = []
         all_reg_ent:     list[float]        = []
+        all_reg_mix:     list[float]        = []
 
         with torch.no_grad():
             for batch in tqdm(val_loader, desc=f"  Val   [{epoch}]", leave=False):
@@ -488,6 +503,7 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
                 _, reg_v = egmdm(emb)
                 all_reg_div.append(reg_v.get('L_div', torch.tensor(0.0)).item())
                 all_reg_ent.append(reg_v.get('L_ent', torch.tensor(0.0)).item())
+                all_reg_mix.append(reg_v.get('L_mix', torch.tensor(0.0)).item())
 
         avg_vl_loss = vl_loss / len(val_loader)
         avg_vl_nll  = vl_nll  / len(val_loader)
@@ -535,6 +551,7 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
             "train/reg_ent":         avg_tr_reg_ent,
             "val/reg_div":           sum(all_reg_div) / max(len(all_reg_div), 1),
             "val/reg_ent":           sum(all_reg_ent) / max(len(all_reg_ent), 1),
+            "val/reg_mix":           sum(all_reg_mix) / max(len(all_reg_mix), 1),
         }
         # Log mean attention weight entropy as a measure of how focused
         # the model's attention is across slices.  Each patient has a
@@ -606,5 +623,131 @@ def train_survival(cfg: SurvivalConfig | None = None) -> str:
     return cfg.best_ckpt
 
 
+
+# ─── K-fold wrapper ───────────────────────────────────────────────────────────
+
+def train_survival_kfold(cfg: SurvivalConfig | None = None) -> dict:
+    """
+    Run k-fold cross-validation for one survival experiment configuration.
+
+    For each fold:
+      - Trains a fresh model (attention + EGMDM + optional clinical MLP)
+      - Logs per-fold metrics to W&B (each fold is its own run in the same group)
+      - Saves best checkpoint to:
+          runs/<exp>/<variant>/kfold_<k>/seed_<s>/fold_<i>/best.pth
+
+    After all folds:
+      - Computes mean ± std of val C-index across folds
+      - Logs aggregate summary to a dedicated W&B summary run
+
+    Returns
+    -------
+    dict with keys: fold_cindices, mean_cindex, std_cindex, best_ckpts
+    """
+    import dataclasses
+    import numpy as np
+
+    cfg = cfg or SurvivalConfig()
+    assert cfg.use_kfold, "Call train_survival_kfold only when cfg.use_kfold=True"
+
+    log = logging.getLogger(__name__)
+
+    # ── All case IDs + event labels for stratified splitting ──────────────
+    all_ids       = get_all_case_ids(cfg.json_path)
+    metadata_path = os.path.join(cfg.root_dir, "kits23.json")
+    events        = load_events_from_metadata(metadata_path, all_ids)
+
+    folds = make_kfold_splits(all_ids, events, n_folds=cfg.n_folds, seed=cfg.seed)
+
+    log.info(
+        f"Starting {cfg.n_folds}-fold CV  |  "
+        f"experiment: {cfg.experiment_name}  |  seed: {cfg.seed}"
+    )
+
+    fold_cindices: list[float] = []
+    best_ckpts:    list[str]   = []
+
+    for fold_idx, (train_ids, val_ids) in enumerate(folds):
+        log.info(
+            f"\n{'#'*65}\n"
+            f"  Fold {fold_idx + 1}/{cfg.n_folds}  —  "
+            f"train={len(train_ids)}  val={len(val_ids)}\n"
+            f"{'#'*65}"
+        )
+
+        # Fold-specific config: only fold_idx and run_dir change
+        fold_cfg = dataclasses.replace(cfg, fold_idx=fold_idx)
+        # Inject case IDs — KitsDataset reads via getattr with None default
+        fold_cfg._kfold_train_ids = train_ids
+        fold_cfg._kfold_val_ids   = val_ids
+
+        best_ckpt = train_survival(fold_cfg)
+        best_ckpts.append(best_ckpt)
+
+        ckpt        = torch.load(best_ckpt, map_location="cpu")
+        best_cindex = ckpt.get("val_cindex", float("nan"))
+        fold_cindices.append(best_cindex)
+
+        log.info(f"  Fold {fold_idx + 1} complete  →  best C-index: {best_cindex:.4f}")
+
+    # ── Aggregate ─────────────────────────────────────────────────────────
+    arr  = np.array(fold_cindices)
+    mean = float(arr.mean())
+    std  = float(arr.std())
+
+    log.info(f"\n{'='*65}")
+    log.info(f"  {cfg.n_folds}-FOLD CV RESULTS  (seed={cfg.seed})")
+    log.info(f"{'='*65}")
+    for i, (ci, ckpt) in enumerate(zip(fold_cindices, best_ckpts)):
+        log.info(f"  Fold {i:2d}  C-index: {ci:.4f}  →  {ckpt}")
+    log.info(f"  {'─'*60}")
+    log.info(f"  Mean  C-index: {mean:.4f} ± {std:.4f}")
+    log.info(f"{'='*65}\n")
+
+    # ── W&B summary run ───────────────────────────────────────────────────
+    wandb.login(key=os.environ["WANDB_API_KEY"])
+    summary_run = wandb.init(
+        project = cfg.wandb_project,
+        name    = (
+            f"{cfg.experiment_name}_{cfg._variant}_seed{cfg.seed}"
+            f"_{cfg.n_folds}fold_summary"
+        ),
+        group   = cfg.experiment_name,
+        config  = {**cfg.to_dict(), "fold_cindices": str(fold_cindices)},
+        notes   = cfg.wandb_notes or None,
+        tags    = (cfg.wandb_tags or []) + ["kfold_summary"],
+        reinit  = True,
+    )
+    for i, ci in enumerate(fold_cindices):
+        wandb.log({f"fold/cindex": ci, "fold/index": i}, step=i)
+
+    wandb.log({
+        "kfold/mean_cindex": mean,
+        "kfold/std_cindex":  std,
+        "kfold/n_folds":     cfg.n_folds,
+    })
+    summary_run.summary.update({
+        "kfold_mean_cindex": mean,
+        "kfold_std_cindex":  std,
+        "best_fold":         int(arr.argmax()),
+        "best_fold_cindex":  float(arr.max()),
+        "worst_fold_cindex": float(arr.min()),
+    })
+    wandb.finish()
+
+    return {
+        "fold_cindices": fold_cindices,
+        "mean_cindex":   mean,
+        "std_cindex":    std,
+        "best_ckpts":    best_ckpts,
+    }
+
+
 if __name__ == "__main__":
-    train_survival()
+    import sys
+    _cfg = SurvivalConfig()
+    if "--kfold" in sys.argv:
+        _cfg.use_kfold = True
+        train_survival_kfold(_cfg)
+    else:
+        train_survival(_cfg)
