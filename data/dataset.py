@@ -29,7 +29,7 @@ class KitsDataset(Dataset):
         target_shape:   tuple,          # (H, W) after spatial resize
         split_file:     str,
         metadata_path:  str,
-        p:              float = 0.8,    # prob of tumour-centred depth crop
+        p:              float = 0.9,    # prob of tumour-centred depth crop
         mode:           str   = "train",
         crop_depth:     int   = 16,
         case_ids:       list  = None,   # override split file with explicit IDs (k-fold)
@@ -79,8 +79,8 @@ class KitsDataset(Dataset):
         image, mask = self._to_tensors(image, mask)
         image, mask = self._spatial_resize(image, mask)  # H, W → target_shape
 
-        if self.mode == "train":
-            image, mask = self._train_crop(image, mask)  # (crop_depth, H, W)
+        # if self.mode == "train":
+        image, mask = self._train_crop(image, mask)  # (crop_depth, H, W)
         # val: full volume (D, H, W) — sliding window handled in training loop
 
         event, survival_time = self._get_survival(caseid)

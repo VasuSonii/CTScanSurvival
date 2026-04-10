@@ -17,7 +17,7 @@ Dice is therefore evaluated hierarchically:
 """
 
 import torch
-
+from lifelines.utils import concordance_index as lifelines_cindex
 
 def compute_kits_dice(
     logits:  torch.Tensor,   # (B, C, D, H, W)
@@ -59,21 +59,26 @@ def concordance_index(
     Compares all pairs (i, j) where patient i experienced the event
     before patient j.
     """
-    n = len(times)
-    concordant = discordant = 0
+    # n = len(times)
+    # concordant = discordant = 0
 
-    for i in range(n):
-        if not events[i]:
-            continue
-        for j in range(n):
-            if i == j:
-                continue
-            if times[i] < times[j]:
-                concordant += (risk[i] > risk[j]).item()
-                discordant += (risk[i] < risk[j]).item()
+    # for i in range(n):
+    #     if not events[i]:
+    #         continue
+    #     for j in range(n):
+    #         if i == j:
+    #             continue
+    #         if times[i] < times[j]:
+    #             concordant += (risk[i] > risk[j]).item()
+    #             discordant += (risk[i] < risk[j]).item()
 
-    total = concordant + discordant
-    return concordant / total if total > 0 else 0.5
+    # total = concordant + discordant
+    # return concordant / total if total > 0 else 0.5
+    return lifelines_cindex(
+        event_times=times.detach().cpu().numpy(),
+        predicted_scores=-risk.detach().cpu().numpy(),  # Use negative risk if scores are 'higher = better'
+        event_observed=events.detach().cpu().numpy()
+    )
 
 
 def compute_hector_dice(

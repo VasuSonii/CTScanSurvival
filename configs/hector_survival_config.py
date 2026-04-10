@@ -31,15 +31,15 @@ from typing import Optional
 class HectorSurvivalConfig:
     # ── Experiment identity ────────────────────────────────────────────────
     experiment_name: str = "hector_survival-folds"
-    seed:            int = 98
+    seed:            int = 42
 
     # ── Device ────────────────────────────────────────────────────────────
-    device: str = "cuda:0"
+    device: str = "cuda:2"
 
     # ── Data paths ─────────────────────────────────────────────────────────
-    task2_dir:    str = "/home/sandeep/HECKTOR2025/HECKTOR_2025_Training_Data/Task 2"
-    metadata_csv: str = "/home/sandeep/HECKTOR2025/HECKTOR_2025_Training_Data/Task 2/HECKTOR_2025_Training_Task_2.csv"
-    split_file:   str = "/home/sandeep/HECKTOR2025/HECKTOR_2025_Training_Data/dataset_split_fixed.json"
+    task2_dir:    str = "/home/sandeep/RAW_DATA/HECKTOR2025/HECKTOR_2025_Training_Data/Task 2"
+    metadata_csv: str = "/home/sandeep/RAW_DATA/HECKTOR2025/HECKTOR_2025_Training_Data/Task 2/HECKTOR_2025_Training_Task_2.csv"
+    split_file:   str = "/home/sandeep/RAW_DATA/HECKTOR2025/HECKTOR_2025_Training_Data/dataset_split_fixed.json"
 
     # ── UNet checkpoint (trained on Task 1) ───────────────────────────────
     unet_ckpt: Optional[str] = None  # derived in __post_init__ from seed

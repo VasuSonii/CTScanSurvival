@@ -127,7 +127,7 @@ class SurvivalConfig:
     missing_threshold:    float = 0.40
 
     # ── W&B ────────────────────────────────────────────────────────────────
-    wandb_project: str  = "kits23-survival-folds"
+    wandb_project: str  = "kits23-survival-folds-new"
     # notes : free-text shown on the W&B run page — describe the experiment,
     #         hypothesis, or anything you want searchable later.
     wandb_notes:  str   = ""
